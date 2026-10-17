@@ -6,6 +6,8 @@ import sys
 import time
 import traceback
 
+from .long_paths import io_path, plain
+
 
 def theme():
     """branding.py's palette for QML, so the launcher and ComfyUI views match.
@@ -59,7 +61,15 @@ def create_ui(session, *, show=True):
     app.setOrganizationName('FreeVideo')
     app.styleHints().setColorScheme(Qt.ColorScheme.Dark)
     font = QFont()
-    font.setFamilies(['Segoe UI', 'Microsoft YaHei UI', 'Noto Sans', 'Noto Sans CJK SC', 'sans-serif'])
+    families = ['Segoe UI', 'Microsoft YaHei UI', 'Noto Sans', 'Noto Sans CJK SC']
+    # The Linux AppImage carries the launcher's Chinese characters for desktops
+    # without a Chinese font; a complete system font still comes first.
+    from PySide6.QtGui import QFontDatabase
+    for path in sorted((io_path(Path(__file__).parent) / 'assets/fonts').glob('*.otf')):
+        for family in QFontDatabase.applicationFontFamilies(QFontDatabase.addApplicationFont(plain(path))):
+            if family not in families:
+                families.append(family)
+    font.setFamilies(families + ['sans-serif'])
     font.setPointSize(10)
     app.setFont(font)
     icon = launcher_icon()
@@ -67,10 +77,12 @@ def create_ui(session, *, show=True):
 
     class Bridge(QObject):
         changed = Signal()
+        downloadsChanged = Signal()
         def __init__(self):
             super().__init__(engine)
             self.alerted = None
             self.value = session.snapshot()
+            self.download_value = session.downloads_view()
             self.timer = QTimer(self)
             self.timer.setInterval(250)
             self.timer.timeout.connect(self.refresh)
@@ -80,9 +92,13 @@ def create_ui(session, *, show=True):
         def state(self):
             return self.value
 
-        def invoke(self, function, *args):
+        @Property('QVariantMap', notify=downloadsChanged)
+        def downloadList(self):
+            return self.download_value
+
+        def invoke(self, function, *args, **kwargs):
             try:
-                function(*args)
+                function(*args, **kwargs)
             except Exception:
                 session.error = traceback.format_exc()
             self.refresh()
@@ -95,6 +111,10 @@ def create_ui(session, *, show=True):
                 if value != self.value:
                     self.value = value
                     self.changed.emit()
+                downloads = session.downloads_view()
+                if downloads is not self.download_value:
+                    self.download_value = downloads
+                    self.downloadsChanged.emit()
                 update = value.get('update') or {}
                 if update.get('remind') and update.get('key') != self.alerted and engine.rootObjects():
                     # Flash the taskbar button once per new reminder when the
@@ -109,8 +129,17 @@ def create_ui(session, *, show=True):
             except Exception:
                 # A failed status read must remain copyable and not kill the UI.
                 session.error = traceback.format_exc()
-                self.value = dict(self.value, error=session.error)
-                self.changed.emit()
+                from .offline_errors import alias_failure
+                if alias_failure(session.error):
+                    # The card says what to do; the details keep the cause.
+                    from .failure_details import launcher_failure
+                    zh = session.language.startswith('zh')
+                    value = dict(self.value, error=session.error, failure=launcher_failure(session.error, zh=zh))
+                else:
+                    value = dict(self.value, error=session.error)
+                if value != self.value:
+                    self.value = value
+                    self.changed.emit()
 
         @Slot(str, 'QVariant')
         def edit(self, key, value):
@@ -120,6 +149,10 @@ def create_ui(session, *, show=True):
         def action(self, name, accepted=False):
             self.invoke(session.action, name, accepted)
 
+        @Slot(str)
+        def useDisk(self, folder):
+            self.invoke(session.use_disk, folder)
+
         @Slot(bool)
         def cleanupDownloads(self, remove=False):
             self.invoke(session.cleanup_downloads, remove)
@@ -127,6 +160,10 @@ def create_ui(session, *, show=True):
         @Slot()
         def upgradeModel(self):
             self.invoke(session.upgrade_model)
+
+        @Slot(str)
+        def imagePackAction(self, action):
+            self.invoke(session.image_pack_action, action)
 
         @Slot()
         def cancelModelUpgrade(self):
@@ -138,12 +175,34 @@ def create_ui(session, *, show=True):
 
         @Slot(str)
         def browse(self, key):
-            if session.controller.busy:
+            if not session.can_manage():
+                self.invoke(session.explain_busy)
                 return
             path = QFileDialog.getExistingDirectory(None, session.t('Choose folder', '选择文件夹'),
                 str(session.form.get(key) or ''), QFileDialog.ShowDirsOnly)
             if path:
                 self.invoke(session.add_folder, path) if key == 'model_dirs' else self.invoke(session.edit, key, path)
+
+        @Slot()
+        def prepareDownloadList(self):
+            self.invoke(session.prepare_download_list)
+
+        @Slot()
+        def exportDownloadList(self):
+            if session.controller.busy:
+                return
+            path = QFileDialog.getExistingDirectory(None, session.downloads_view()['copy']['export'], '', QFileDialog.ShowDirsOnly)
+            if path:
+                self.invoke(session.export_downloads, path)
+
+        @Slot()
+        def useDownloadedFolder(self):
+            if not session.can_manage():
+                self.invoke(session.explain_busy)
+                return
+            path = QFileDialog.getExistingDirectory(None, session.downloads_view()['copy']['use_folder'], '', QFileDialog.ShowDirsOnly)
+            if path:
+                self.invoke(session.use_downloaded_folder, path)
 
         @Slot()
         def browsePackages(self):
@@ -185,6 +244,14 @@ def create_ui(session, *, show=True):
             self.invoke(session.remove_folder, index)
 
         @Slot(str)
+        def setLanPassword(self, value):
+            self.invoke(session.change_lan_password, value)
+
+        @Slot()
+        def removeLanPassword(self):
+            self.invoke(session.change_lan_password, None)
+
+        @Slot(str)
         def copy(self, value):
             app.clipboard().setText(value)
 
@@ -206,8 +273,27 @@ def create_ui(session, *, show=True):
 
         @Slot(str)
         def link(self, value):
-            from .windows_ux import open_browser
-            self.invoke(open_browser, value)
+            # A licence may be a text file on this computer rather than a web page.
+            from .component_licenses import is_file
+            from .windows_ux import open_browser, open_text
+            if is_file(value):
+                # A text inside the installation in use is opened through that installation's folder.
+                engine = session.installation_engine()
+                self.invoke(open_text, value, **(dict(engine=engine) if engine else {}))
+            else:
+                self.invoke(open_browser, value)
+
+        @Slot()
+        def openDownloadFolder(self):
+            from PySide6.QtGui import QDesktopServices
+            folder = session.download_export
+            if folder and Path(folder).is_dir():
+                if session.action_notice == 'download_missing':
+                    session.action_notice = ''
+                self.invoke(QDesktopServices.openUrl, QUrl.fromLocalFile(str(Path(folder).resolve())))
+            else:
+                session.action_notice = 'download_missing'
+                self.refresh()
 
         @Slot(str)
         def selectSource(self, value):
@@ -224,6 +310,10 @@ def create_ui(session, *, show=True):
         @Slot(int, bool)
         def compatibility(self, level, automatic):
             self.invoke(session.set_compatibility, level, automatic)
+
+        @Slot(int)
+        def compatibilityLevel(self, level):
+            self.invoke(session.set_compatibility_level, level)
 
         @Slot(str)
         def update(self, token):
@@ -260,17 +350,11 @@ def create_ui(session, *, show=True):
             self.timer.stop()
             session.close()
 
-    from .model_guidance import links, cloud_models
-    from .launcher_copy import display
+    from .model_guidance import cloud_models
     engine = QQmlApplicationEngine()
     bridge = Bridge()
     engine.rootContext().setContextProperty('backend', bridge)
     engine.rootContext().setContextProperty('initialState', bridge.value)
-    # Nested Python tuples remain opaque objects in QML. Named maps become
-    # QVariantMaps, so both the displayed label and clicked URL are available.
-    engine.rootContext().setContextProperty('modelLinks', {
-        component: [dict(label=label, label_zh=display(label, True), url=url) for label, url in rows]
-        for component, rows in links().items()})
     engine.rootContext().setContextProperty('cloudLinks', cloud_models())
     engine.rootContext().setContextProperty('theme', theme())
     engine.load(QUrl.fromLocalFile(str(Path(__file__).parent / 'launcher/Main.qml')))
@@ -299,6 +383,11 @@ def create_ui(session, *, show=True):
     return app, engine, window, bridge
 
 
+def save_screenshot(window, bridge, path):
+    if not bridge.value.get('access_links'):
+        window.grabWindow().save(str(path))
+
+
 def smoke_test(app, engine, window, bridge, destination):
     """Exercise the packaged QML, manifests and managed-Python entry point."""
     import queue
@@ -321,12 +410,30 @@ def smoke_test(app, engine, window, bridge, destination):
             primary = window.findChild(QQuickItem, 'primaryButton')
             if primary is None or not primary.isVisible() or primary.width() < 40:
                 raise RuntimeError('Packaged launcher action is not visible: ' + page)
+            if page == 'progress':
+                # The last setup step shows the finished ones with a check mark; keep it for the font check.
+                save_screenshot(window, bridge, destination / 'launcher-steps.png')
         window.setProperty('settingsOpen', True)
         app.processEvents()
         window.setProperty('settingsOpen', False)
+        # The licence list opens, and an offline runtime's licence texts open from the package itself.
+        from PySide6.QtCore import QObject
+        from . import component_licenses as licences
+        window.setProperty('licensesOpen', True)
+        app.processEvents()
+        dialog = window.findChild(QObject, 'licensesDialog')
+        if dialog is None or not dialog.property('visible'):
+            raise RuntimeError('Packaged launcher licence list does not open')
+        window.setProperty('licensesOpen', False)
+        rows = licences.bundle(destination, dict(files=[dict(path=name) for name in ('cudart64_13.dll', 'cudnn64_9.dll', 'libiomp5md.dll')]))
+        texts = {row['key']: row['link'] for row in rows[2:]}
+        missing = {key: link for key, link in texts.items() if not licences.is_file(link) or not io_path(link).is_file()}
+        if len(texts) != 4 or missing:
+            raise RuntimeError('Packaged licence texts are missing: %r' % (missing or texts))
         session.page = 'comfy'
         bridge.refresh()
-        payload.update(wizard_pages=3, launcher_page=True, download_controls=True, renderer='Qt Quick/software')
+        payload.update(wizard_pages=3, launcher_page=True, download_controls=True, renderer='Qt Quick/software',
+                       licence_texts=texts)
         build = current_build()
         if getattr(sys, 'frozen', False) and build is None:
             raise ValueError('Packaged launcher update identity is missing')
@@ -351,13 +458,50 @@ def smoke_test(app, engine, window, bridge, destination):
         save(destination / 'smoke.json', dict(success=bool(result and result['status'] == 'complete' and not imported),
             task=result, interface='Qt Quick launcher', build=build, source=str(session.source),
             payload=payload, model_modules_imported=imported))
-        window.grabWindow().save(str(destination / 'launcher.png'))
+        save_screenshot(window, bridge, destination / 'launcher.png')
         if runner.busy:
             runner.cancel()
         timer.stop()
         app.quit()
     timer.timeout.connect(finish)
     timer.start(100)
+
+
+def smoke_connect(app, engine, window, bridge, destination, values):
+    """Connect the packaged launcher to an existing installation, as a person would, and open ComfyUI.
+
+    Exercises what only a packaged launcher does on a real installation: its
+    helper processes, the environment of the programs it starts, its source copy.
+    """
+    from PySide6.QtCore import QTimer
+    from .comfy_launcher_runtime import server_info
+    from .monitoring import save
+    destination = Path(destination)
+    destination.mkdir(parents=True, exist_ok=True)
+    session = engine.session
+    for key, value in values.items():
+        session.edit(key, value)
+    session.action('primary')
+    session.action('primary')
+    deadline = time.monotonic() + 900
+    timer = QTimer(bridge)
+    def step():
+        state = session.controller.state
+        status = state.get('status')
+        if session.controller.busy:
+            return
+        if status == 'review' and time.monotonic() < deadline:
+            session.action('primary', True)
+            return
+        if status in ('open', 'failed', 'cancelled', 'restart-required') or time.monotonic() > deadline:
+            info = server_info(state['url'].split('/?')[0]) if status == 'open' else {}
+            save(destination / 'connect.json', dict(success=status == 'open' and info.get('status') == 'freevideo',
+                                                    status=status, error=state.get('error'), url=state.get('url'), server=info))
+            save_screenshot(window, bridge, destination / 'connected.png')
+            timer.stop()
+            app.quit()
+    timer.timeout.connect(step)
+    timer.start(250)
 
 
 def main(session=None):
@@ -378,17 +522,30 @@ def main(session=None):
         freevideo_engine.__path__.insert(0, str(source / 'freevideo_engine'))
         from .managed import main as managed
         raise SystemExit(managed(sys.argv[3:]))
-    # Linux process supervision reexecutes sys.executable. A frozen GUI must
-    # dispatch this helper before creating another application window.
-    if (getattr(sys, 'frozen', False) and sys.platform == 'linux'
-            and sys.argv[1:4] == ['-B', '-m', 'freevideo_engine.linux_process_host']):
-        from .linux_process_host import main as supervise
-        sys.argv = [sys.argv[3], *sys.argv[4:]]
-        raise SystemExit(supervise())
+    if getattr(sys, 'frozen', False) and sys.platform.startswith('linux'):
+        from .linux_bundle import prepare
+        prepare()
+        # Helpers such as Linux process supervision run this executable again
+        # (processes.module_command); dispatch them before any window exists.
+        if sys.argv[1:2] == ['--freevideo-module'] and len(sys.argv) >= 3:
+            import runpy
+            module = sys.argv[2]
+            if module not in ('freevideo_engine.linux_process_host',):
+                raise SystemExit('Unknown launcher helper: ' + module)
+            # A helper has no window: what PyInstaller set for Qt and for its own
+            # bootloader must not reach the programs it supervises.
+            from .linux_bundle import child_environment
+            clean = child_environment()
+            os.environ.clear()
+            os.environ.update(clean)
+            sys.argv = [module, *sys.argv[3:]]
+            runpy.run_module(module, run_name='__main__', alter_sys=True)
+            raise SystemExit(0)
     smoke = '--smoke-test' in sys.argv
+    connect = json.loads(sys.argv[sys.argv.index('--smoke-connect') + 1]) if smoke and '--smoke-connect' in sys.argv else None
     from .desktop_runtime import launcher_root
     portable_root = Path(sys.executable).parent
-    if session is None and getattr(sys, 'frozen', False) and (portable_root / 'portable.json').is_file() and not smoke:
+    if session is None and getattr(sys, 'frozen', False) and (io_path(portable_root) / 'portable.json').is_file() and not smoke:
         from .portable_launcher import portable_session
         session = portable_session(portable_root)
     if not smoke and session is None:
@@ -412,8 +569,11 @@ def main(session=None):
     app, engine, window, bridge = create_ui(session)
     if smoke:
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, lambda: smoke_test(app, engine, window, bridge,
-            sys.argv[sys.argv.index('--smoke-test')+1]))
+        destination = sys.argv[sys.argv.index('--smoke-test')+1]
+        if connect is not None:
+            QTimer.singleShot(0, lambda: smoke_connect(app, engine, window, bridge, destination, connect))
+        else:
+            QTimer.singleShot(0, lambda: smoke_test(app, engine, window, bridge, destination))
     try:
         app.exec()
     finally:

@@ -11,7 +11,7 @@ from pathlib import Path
 import threading
 from uuid import UUID
 
-from .monitoring import Activity, Monitor
+from .monitoring import Activity, DeviceMemory, Monitor, UnavailablePrograms
 
 
 class LUID(c.Structure):
@@ -71,7 +71,7 @@ class CounterValue(c.Structure):
 
 
 class WDDMMonitor(Monitor):
-    def __init__(self, path, interval=.05, device=None):
+    def __init__(self, path, interval=.05, device=None, pid=None):
         name = os.environ['FREEVIDEO_WINDOWS_AMD_ADAPTER']
         instance, self.total = adapter_memory(name)
         self.device = str(device or name)
@@ -102,6 +102,7 @@ class WDDMMonitor(Monitor):
         self.errors = []
         self.max_temperature = self.max_power_mw = None
         self.activity, self.busy_activity = Activity(), Activity()
+        self.programs = UnavailablePrograms()
 
     @staticmethod
     def check(status):
@@ -126,3 +127,19 @@ class WDDMMonitor(Monitor):
         if self.query:
             self.lib.PdhCloseQuery(self.query)
             self.query = c.c_void_p()
+
+
+class WDDMDeviceMemory(DeviceMemory):
+    """On-demand whole-adapter capacity for the live Windows memory budget."""
+
+    def __init__(self, device=None):
+        # No sampling thread or output file is opened by the monitor constructor.
+        self.monitor = WDDMMonitor(os.devnull, device=device)
+        self.device, self.source = self.monitor.device, self.monitor.source
+
+    def sample(self):
+        used, total, _ = self.monitor.sample()
+        return dict(used_bytes=used, total_bytes=total)
+
+    def close(self):
+        self.monitor.shutdown()

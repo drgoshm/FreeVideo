@@ -1,0 +1,35 @@
+.fv-editor .fv-ed-adjust-host{grid-column:2;grid-row:2/4;justify-self:end;width:264px;min-height:0;overflow:auto;padding:12px;border-left:1px solid var(--fv-border);background:var(--fv-bg);z-index:8;scrollbar-width:thin;scrollbar-color:var(--fv-border) transparent}
+.fv-editor .fv-ed-library{background:var(--fv-bg)}
+.fv-ed-adjust{min-width:0}
+.fv-ed-adjust-status{margin:0 0 12px;color:var(--fv-muted);font-size:13px;line-height:1.6}
+.fv-ed-adjust-controls{border:0;padding:0;margin:0;min-width:0;display:flex;flex-direction:column;gap:12px}
+.fv-ed-adjust-row{display:flex;align-items:center;gap:8px;min-width:0}
+.fv-ed-adjust-label{flex:none;font-size:13px}
+.fv-ed-adjust-row-controls{display:flex;align-items:center;justify-content:flex-end;gap:6px;flex:1;min-width:0}
+.fv-ed-adjust-slider{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+.fv-ed-adjust-slider input{width:0;min-width:0;flex:1;accent-color:var(--fv-accent)}
+.fv-ed-adjust-slider output{font-size:12px;font-variant-numeric:tabular-nums;min-width:36px;text-align:right}
+.fv-ed-adjust-number{flex:1;min-width:0}
+.fv-editor .fv-ed-adjust-number input{width:100%;height:32px;padding:4px 8px;border-radius:var(--fv-r-sm);font-size:13px;font-variant-numeric:tabular-nums}
+.fv-editor .fv-ed-adjust-button{height:32px;padding:0 8px}
+.fv-editor .fv-ed-adjust-segmented{width:100%;min-width:0}
+.fv-editor .fv-ed-adjust-segmented button{flex:1;padding:0 6px}
+.fv-editor .fv-ed-adjust-segmented button[aria-pressed=true]{background:var(--fv-raised);color:var(--fv-ink)}
+.fv-ed-adjust-toggle-control{display:flex;align-items:center;gap:8px;font-size:13px;cursor:pointer}
+.fv-ed-adjust-toggle-control input{accent-color:var(--fv-accent);width:15px;height:15px;margin:0}
+.fv-ed-adjust-controls:disabled :is(.fv-ed-adjust-label,output,.fv-ed-adjust-toggle-control span){opacity:.4}
+.fv-ed-adjust-controls :is(button,input):disabled{opacity:.4;cursor:default}
+.fv-editor .fv-ed-toolbar .fv-ed-adjust-toggle{flex:none}
+@media(min-width:1280px){.fv-editor .fv-ed-adjust-host{grid-column:3}}
+@media(max-width:1279px){
+ /* The drawer overlays its grid cell. Reserve picture space while open so it
+    stays centered in the visible preview, without moving any lower rows. */
+ .fv-editor[data-adjust-open=true] .fv-ed-preview,.fv-editor[data-adjust-open=true] .fv-ed-transport{margin-right:264px}
+}
+@media(max-width:680px){.fv-editor .fv-ed-adjust-host{grid-column:1}}
+@media(min-width:681px) and (max-width:800px){
+ .fv-editor[data-adjust-available=true] .fv-ed-toolbar{gap:4px}
+ .fv-editor[data-adjust-available=true] .fv-ed-toolbar button{padding-left:4px;padding-right:4px}
+ .fv-editor[data-adjust-available=true] .fv-ed-toolbar .fv-ed-zoom-slider{width:40px}
+ .fv-editor[data-adjust-available=true] .fv-ed-toolbar .fv-ed-previous span{display:none}
+}

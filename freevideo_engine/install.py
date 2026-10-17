@@ -6,8 +6,9 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+from . import execution_paths
 from .paths import vdn_root
-from . import network
+from . import network, subprocess_output
 
 
 def install(root=None, *, packages=False):
@@ -15,22 +16,30 @@ def install(root=None, *, packages=False):
     spec = dependencies['vdn']
     root = (root or vdn_root()).expanduser().resolve()
     network.clone(root, spec['url'], spec['commit'])
-    head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=root, text=True).strip()
-    dirty = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=root, text=True)
+    head = subprocess_output.output_external(['git', 'rev-parse', 'HEAD'], cwd=root).strip()
+    dirty = subprocess_output.output_external(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=root)
     if head != spec['commit'] or dirty:
         raise RuntimeError('Existing VDN checkout does not match the clean pinned dependency; use another --vdn-root.')
     diffusers = prepare_diffusers(root, dependencies)
     if packages:
         # Install Torch explicitly first; preserve that CUDA build here.
         if not os.environ.get('FREEVIDEO_UV') and importlib.util.find_spec('pip') is None:
-            subprocess.run([sys.executable, '-m', 'ensurepip', '--upgrade'], check=True)
+            execution_paths.run([sys.executable, '-m', 'ensurepip', '--upgrade'], check=True)
         def install_packages(env, source):
             # The managed installer already has uv, including native SOCKS
             # support; avoid pip's optional PySocks dependency during bootstrap.
             command = ([env['FREEVIDEO_UV'], 'pip', 'install', '--python', sys.executable]
                        if env.get('FREEVIDEO_UV') else [sys.executable, '-m', 'pip', 'install'])
-            result = subprocess.run([*command, '-e', str(diffusers), '--no-deps'],
-                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            # uv is a native program; pip runs in this interpreter's own Python.
+            run = subprocess_output.run_external if env.get('FREEVIDEO_UV') else subprocess_output.run_python
+            if pth_spellable(diffusers):
+                target = ['-e', str(diffusers)]
+            else:
+                # A regular copy carries no path; replace any copy from an older tree.
+                target = [str(diffusers), *(['--reinstall-package', 'diffusers'] if env.get('FREEVIDEO_UV')
+                                            else ['--force-reinstall'])]
+            result = run([*command, *target, '--no-deps'],
+                         env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             print(result.stdout, flush=True)
             if result.returncode:
                 raise RuntimeError(result.stdout[-2500:])
@@ -41,6 +50,26 @@ def install(root=None, *, packages=False):
     print(json.dumps({'vdn_root': str(root), 'commit': head, 'packages_installed': packages,
                       'diffusers_tree': dependencies['diffusers']['patched_tree'],
                       'models_downloaded': False, 'environment_variable': 'FREEVIDEO_VDN_ROOT'}))
+
+
+def pth_spellable(path, *, windows=None, encoding=None):
+    """Whether an editable install may name this folder in a .pth file.
+
+    setuptools writes a src-layout folder into the .pth in the locale code page,
+    and Python 3.12 reads it the same way; UTF-8 mode changes neither. Where the
+    Windows code page cannot spell the folder, a regular copy is installed
+    instead: add_vdn() puts the pinned source first on sys.path either way.
+    """
+    if not (sys.platform == 'win32' if windows is None else windows):
+        return True
+    if encoding is None:
+        import locale
+        encoding = locale.getencoding() if hasattr(locale, 'getencoding') else locale.getpreferredencoding(False)
+    try:
+        str(path).encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return False
+    return True
 
 
 def prepare_diffusers(root, dependencies):
@@ -54,15 +83,15 @@ def prepare_diffusers(root, dependencies):
         if len(patches) != 2:
             raise RuntimeError('Expected the two pinned VDN Diffusers patches')
         for path in patches:
-            subprocess.run(['git', 'apply', '--index', str(path)], cwd=checkout, check=True)
-        tree = subprocess.check_output(['git', 'write-tree'], cwd=checkout, text=True).strip()
+            execution_paths.run(['git', 'apply', '--index', str(path)], cwd=checkout, check=True)
+        tree = subprocess_output.output_external(['git', 'write-tree'], cwd=checkout).strip()
         if tree != spec['patched_tree']:
             raise RuntimeError('Patched Diffusers source tree does not match the tested dependency')
-        subprocess.run(['git', '-c', 'user.name=VDN Engine dependency setup', '-c', 'user.email=engine@localhost',
+        execution_paths.run(['git', '-c', 'user.name=VDN Engine dependency setup', '-c', 'user.email=engine@localhost',
                         'commit', '--quiet', '-m', 'Apply pinned OpenVDN MiniMax H3 patches'], cwd=checkout, check=True)
         checkout.rename(target)
-    tree = subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], cwd=target, text=True).strip()
-    dirty = subprocess.check_output(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=target, text=True)
+    tree = subprocess_output.output_external(['git', 'rev-parse', 'HEAD^{tree}'], cwd=target).strip()
+    dirty = subprocess_output.output_external(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=target)
     if tree != spec['patched_tree'] or dirty:
         raise RuntimeError('Existing Diffusers differs from the clean tested tree; use another VDN dependency directory.')
     return target

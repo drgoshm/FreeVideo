@@ -1,0 +1,14 @@
+English speech recognition model for automatic subtitles
+
+Original work: NVIDIA NeMo "stt_en_conformer_ctc_small"
+https://huggingface.co/nvidia/stt_en_conformer_ctc_small
+Copyright (c) NVIDIA Corporation
+Licensed under the Creative Commons Attribution 4.0 International licence (CC-BY-4.0)
+https://creativecommons.org/licenses/by/4.0/
+
+Changes: the model was exported to ONNX and quantized to int8 by the sherpa-onnx
+project (csukuangfj/sherpa-onnx-nemo-ctc-en-conformer-small). FreeVideo uses that
+file unchanged.
+
+The model is provided as is, without warranty of any kind. This is not an official
+NVIDIA release and NVIDIA does not endorse FreeVideo.

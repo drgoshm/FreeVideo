@@ -7,6 +7,7 @@ import argparse
 import json
 from pathlib import Path
 import re
+from .long_paths import io_path, plain_errors
 
 PRODUCT_VERSION = re.compile(r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)')
 MAX_NOTES_BYTES = 24000
@@ -71,6 +72,24 @@ def since(release, installed):
     return [row for row in rows if version_key(row['product_version']) > version_key(current)]
 
 
+def older(candidate, installed):
+    """Whether candidate is an earlier release than installed, by their stamped identities.
+
+    The product version decides; within one version, the build time. A build
+    that carries neither cannot be ordered, so it never counts as older."""
+    first, second = product_version(candidate.get('product_version')), product_version(installed.get('product_version'))
+    if first and second and first != second:
+        return version_key(first) < version_key(second)
+    early, late = candidate.get('built_at'), installed.get('built_at')
+    return type(early) is int and type(late) is int and 0 < early < late
+
+
+def label(identity):
+    """How a build names itself to people: its product version, else its build number."""
+    version = product_version(identity.get('product_version'))
+    return 'v' + version if version else str(identity.get('version') or '')
+
+
 def optional_fields(value):
     result = {}
     if not isinstance(value, dict):
@@ -86,9 +105,10 @@ def optional_fields(value):
     return result
 
 
+@plain_errors
 def catalog(package=None):
     """Builds must fail on incomplete translations, before uploading anything."""
-    package = Path(package) if package is not None else Path(__file__).parent
+    package = io_path(package if package is not None else Path(__file__).parent)
     value = json.loads((package / 'release_notes.json').read_text(encoding='utf-8'))
     version, release = product_version(value.get('product_version')), notes(value)
     if not version or not release:
@@ -109,7 +129,7 @@ def public_details(value):
 
 
 def installed_details(package, fallback=None):
-    package = Path(package)
+    package = io_path(package)
     try:
         from .launcher_update import build_identity
         return public_details(build_identity(json.loads((package / 'build-identity.json').read_text(encoding='utf-8'))))

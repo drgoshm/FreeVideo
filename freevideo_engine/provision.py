@@ -7,13 +7,15 @@ import time
 import threading
 from concurrent.futures import ThreadPoolExecutor, CancelledError
 
-from .bootstrap import PACKAGE, model_target
+from .bootstrap import PACKAGE, model_target, installation_model_files
 from .locking import runtime_lock
 from .monitoring import save
-from .install_tuning import required_models, hf_receipt, unchanged_before
+from .install_tuning import hf_receipt, unchanged_before
 from . import network
 from .storage import record_download, compact_sources, fingerprint
 from . import model_transfer
+from . import model_repair
+from .install_activity import byte_progress, step
 
 
 def model_headers(source):
@@ -66,15 +68,22 @@ def models(plan):
     ledger = root / 'verified-models.json'
     stamps = json.loads(ledger.read_text(encoding='utf-8')) if ledger.is_file() else {}
     model_dir, encoder_dir = (Path(plan[name]).expanduser().resolve() for name in ('model_dir', 'encoder_dir'))
-    from . import prepared_model
     prepared = plan.get('prepared_model')
-    files = list(required_models(json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8')), plan.get('reuse_cache') or prepared))
-    files += prepared_model.files(prepared)
-    from .sampling_assets import install_files, usable_with
-    if prepared or (plan.get('reuse_cache') and usable_with(plan['reuse_cache'])):
-        files += install_files(bool(plan.get('sampling_caches')))
+    files = installation_model_files(prepared, plan.get('reuse_cache'), plan.get('sampling_caches'))
     mode = plan.get('verification', 'auto')
     from .local_models import key as local_key, import_file
+    lock = threading.RLock()
+
+    def emit(event, **details):
+        with lock:
+            # One write keeps concurrent progress events on separate lines.
+            import sys
+            sys.stdout.write(json.dumps(dict(event=event, **details)) + '\n')
+            sys.stdout.flush()
+
+    replacements = {entry['path']: entry for entry in plan.get('replace_models', [])}
+    if len(replacements) != len(plan.get('replace_models', [])):
+        raise ValueError(model_repair.CHANGED)
     local_files, missing = [], []
     destinations = set()
     # Cheap metadata only: start known downloads without first hashing tens of
@@ -85,15 +94,25 @@ def models(plan):
         if path in destinations:
             raise ValueError('Duplicate model destination in installation plan: ' + str(path))
         destinations.add(path)
+        approved = replacements.get(str(path))
+        if approved:
+            if approved.get('expected_bytes') != row['bytes'] or approved.get('file') != path.name:
+                raise ValueError(model_repair.CHANGED)
+            model_repair.check(path, approved)
         local = (plan.get('local_models') or {}).get('matches', {}).get(local_key(row))
         entry = (row, path, hf_directory, local)
-        (local_files if path.exists() or path.is_symlink() or local else missing).append(entry)
+        (local_files if not approved and (path.exists() or path.is_symlink() or local) else missing).append(entry)
+    if set(replacements) - {str(path) for path in destinations}:
+        raise ValueError(model_repair.CHANGED)
     space_saver = plan.get('disk_mode') == 'extreme'
     if space_saver:
         from .install_disk import check_models
-        check_models(local_files + missing)
+        check_models(local_files + missing, replacements=replacements)
+    for name, approved in replacements.items():
+        retained = model_repair.retain(root, Path(name), approved)
+        stamps.pop(name, None)
+        emit('model_retained', file=name, keep_as=approved['keep_as'], retained=str(retained), bytes=approved['bytes'])
     stopped = threading.Event()
-    lock = threading.RLock()
     failures = []
     ready = [0]
 
@@ -104,15 +123,7 @@ def models(plan):
             from .install_disk import check_floor
             check_floor((root, model_dir, encoder_dir))
 
-    def emit(event, **details):
-        with lock:
-            # One write preserves JSON lines when the verifier and downloader
-            # both report progress. The only retained buffers are hash chunks.
-            import sys
-            sys.stdout.write(json.dumps(dict(event=event, **details)) + '\n')
-            sys.stdout.flush()
-
-    from .model_status import ModelProgress
+    from .model_status import ModelProgress, NAMES, family
     model_progress = ModelProgress([(entry[0], 'found') for entry in local_files] +
                                    [(entry[0], 'download') for entry in missing], emit)
     model_progress.update()
@@ -140,16 +151,23 @@ def models(plan):
                     now = time.monotonic()
                     if done == 0 or done == total or now - last[0] >= .5:
                         emit('model_verification_progress', file=path.name, done_bytes=done,
+                             name=NAMES[family(row)][0],
                              total_bytes=total, bytes_per_second=done / max(.001, now-started),
                              files_done=index, files_total=len(local_files), state='running')
                         model_progress.update(row, phase='verifying')
                         last[0] = now
                 progress(0, row['bytes'])
                 prior = {str(path): stamps.get(str(path), {})}
+                before = model_repair.identity(path)
                 if verified(path, row, prior, mode=mode, hf_directory=hf_directory, progress=progress):
                     complete(row, path, prior[str(path)], 'verify')
                 elif path.exists() or path.is_symlink():
-                    raise ValueError('Existing model failed pinned integrity check; preserved without overwrite: ' + str(path))
+                    if before is None:
+                        raise ValueError('Existing model failed integrity check; preserved without overwrite: ' + str(path))
+                    model_repair.record(root, path, row, before)
+                    raise ValueError(model_repair.MISMATCH + ': ' + path.name + '\n' +
+                                     model_repair.MISMATCH_PATH + ': ' + str(path) + '\n' +
+                                     model_repair.CLI_FAILURE.format(file=path.name))
                 elif local:
                     def local_progress(value):
                         check()
@@ -193,17 +211,19 @@ def models(plan):
             # ownership of, replace, or download over that newly present file.
             if path.exists() or path.is_symlink():
                 prior = {}
-                if not verified(path, row, prior, mode=mode, hf_directory=hf_directory):
+                if not verified(path, row, prior, mode=mode, hf_directory=hf_directory,
+                                progress=byte_progress('verify_progress', path, name=NAMES[family(row)][0])):
                     raise ValueError('Model destination appeared with unexpected content: ' + str(path))
                 complete(row, path, prior[str(path)], 'verify')
                 return
-            emit('download_model', file=str(path), bytes=row['bytes'])
+            emit('download_model', file=str(path), bytes=row['bytes'], name=NAMES[family(row)][0])
             model_progress.update(row, phase='downloading')
             last_progress = [0.]
             def progress(done, total, speed, **extra):
                 check()
                 if time.monotonic() - last_progress[0] >= 1:
                     emit('download_progress', description=path.name, done_bytes=done,
+                         name=NAMES[family(row)][0],
                          total_bytes=total, bytes_per_second=speed, **extra)
                     model_progress.update(row, phase='verifying' if done == row['bytes'] else 'downloading', done=done, rate=speed)
                     last_progress[0] = time.monotonic()
@@ -245,7 +265,7 @@ def models(plan):
                         raise ValueError('Model destination appeared with unexpected content: ' + str(path))
                     complete(row, path, prior[str(path)], 'verify')
                     return
-                emit('download_model', file=str(path), bytes=row['bytes'])
+                emit('download_model', file=str(path), bytes=row['bytes'], name=NAMES[family(row)][0])
                 model_progress.update(row, phase='downloading')
                 path.parent.mkdir(parents=True, exist_ok=True)
                 last = [0.]
@@ -254,8 +274,11 @@ def models(plan):
                     if time.monotonic() - last[0] >= .5:
                         model_progress.update(row, phase='downloading', done=done, rate=speed)
                         last[0] = time.monotonic()
+                # Setup's approval to start a file over when its source cannot resume
+                # (model_transfer passes it for the large files) covers the tables too.
                 network.download(network.model_urls(networking, row), path, row['sha256'], progress,
-                                 network=dict(networking, quiet=True), size=row['bytes'],
+                                 network=dict(networking, quiet=True, allow_model_restart=plan.get('allow_model_restart', False)),
+                                 size=row['bytes'],
                                  category=network.model_family(row), headers_for=model_headers,
                                  keep_partial=True, stall_seconds=30, slow_seconds=15, low_speed_limit=64 * 1024)
                 complete(row, path, dict(file_identity(path, row), method='full_content_hash_resumable_download'),
@@ -383,22 +406,30 @@ def verify_cache(plan, cache):
         raise ValueError('Prepared cache is not complete; original model files retained')
     ledger = Path(plan['root']) / 'verified-cache.json'
     stamps = json.loads(ledger.read_text(encoding='utf-8')) if ledger.is_file() else {}
-    for row in groups:
+    assets = list(validate_catalog(manifest, count))
+    total = len(groups) + len(assets)
+    step('Model files verifying', 0, total)
+    for index, row in enumerate(groups, 1):
         if row['file'] != row['group'] + '.safetensors':
             raise ValueError('Unexpected FP8 group path; original files retained')
         if not verified(cache / row['file'], row, stamps, mode=plan.get('verification', 'auto'),
-                        producer_receipt=cache / 'manifest.json'):
+                        producer_receipt=cache / 'manifest.json',
+                        progress=byte_progress('verify_progress', cache / row['file'])):
             raise ValueError('Existing FP8 cache failed integrity check: ' + row['file'] + '. Rerun setup with --rebuild-cache; failed files are retained.')
-    for row, identity in validate_catalog(manifest, count):
+        step('Model files verifying', index, total)
+    for index, (row, identity) in enumerate(assets, len(groups) + 1):
         path = asset_path(cache, row['file'])
-        if not verified(path, row, stamps, mode=plan.get('verification', 'auto')):
+        if not verified(path, row, stamps, mode=plan.get('verification', 'auto'),
+                        progress=byte_progress('verify_progress', path)):
             raise ValueError('AdaLN model asset failed integrity check: ' + row['file'])
         check_table(path, row, identity, verify_hash=False)
+        step('Model files verifying', index, total)
     save(ledger, stamps)
     return manifest
 
 
 def prepare(plan, out):
+    step('Model files preparing')
     root = Path(plan['root'])
     prepared = plan.get('prepared_model')
     cache_format = dict(capability=plan.get('inventory', {}).get('hardware', {}).get('capability'),
@@ -487,7 +518,13 @@ def main():
     if args.cleanup:
         record = json.loads((Path(plan['root']) / 'prepared-cache.json').read_text(encoding='utf-8'))
         verify_cache(plan, record['cache'])
-        result = compact_sources(plan, json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8')), args.out)
+        reporters = {}
+        def cleanup_progress(path, done, total):
+            if path not in reporters:
+                reporters[path] = byte_progress('verify_progress', path)
+            reporters[path](done, total)
+        result = compact_sources(plan, json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8')), args.out,
+                                 progress=cleanup_progress)
         print(json.dumps({'event': 'storage_compacted', **result}), flush=True)
     elif args.prepare:
         prepare(plan, args.out)

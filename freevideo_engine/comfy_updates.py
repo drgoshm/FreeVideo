@@ -37,7 +37,7 @@ def launcher_view(status):
     """The parts of a launcher status a page may show; None without a launcher."""
     if not isinstance(status, dict):
         return None
-    view = {k: status.get(k) for k in ('version', 'phase', 'status', 'progress', 'candidate', 'engine', 'error', 'manual', 'channel', 'track')}
+    view = {k: status.get(k) for k in ('version', 'phase', 'model', 'status', 'progress', 'candidate', 'engine', 'error', 'manual', 'channel', 'track')}
     view['phase'] = str(view['phase'] or '')
     return view
 
@@ -61,6 +61,7 @@ class UpdateStatus:
         self.client_seen = -1e9
         self.lock = threading.Lock()
         self.thread = None
+        self.failures = 0
 
     def launcher(self):
         if not self.bridge:
@@ -84,7 +85,7 @@ class UpdateStatus:
             # Pages that reload themselves after an update polled recently.
             state['clients'] = int(now - self.client_seen < 20)
         if launcher is not None:
-            if launcher.get('channel') in (launcher_update.CHANNEL, launcher_update.MAC_CHANNEL):
+            if launcher.get('channel') in launcher_update.CHANNELS:
                 state['channel'] = launcher['channel']
             if launcher.get('track') in launcher_update.TRACKS:
                 state['track'] = launcher['track']
@@ -106,18 +107,22 @@ class UpdateStatus:
                     or launcher_update.build_target(candidate) != launcher_update.build_target(self.current)
                     or launcher_update.build_track(candidate) != track):
                 raise ValueError('Update belongs to a different platform')
-            newer = (candidate['built_at'] > self.current['built_at']
-                     and candidate['revision'] != self.current['revision'])
+            newer = launcher_update.newer(candidate, self.current)
             available = public_details(candidate) if newer else None
             with self.lock:
                 self.state.update(status='available' if available else 'current', available=available)
+                self.failures = 0
                 self.next_check = time.monotonic() + 15 * 60
-        except Exception:
+        except Exception as error:
             # Offline/rate-limited checks must not interrupt a running server.
             # Keep a previously verified notice and retry without a user action.
             with self.lock:
+                self.failures += 1
                 self.state['status'] = 'unavailable'
-                self.next_check = time.monotonic() + 60
+                delay = max(min(launcher_update.MAX_RETRY_SECONDS,
+                                launcher_update.RETRY_SECONDS * 2**min(self.failures - 1, 4)),
+                            launcher_update.retry_after(error))
+                self.next_check = time.monotonic() + delay
 
 
 def register():

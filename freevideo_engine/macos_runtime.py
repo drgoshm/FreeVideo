@@ -12,17 +12,54 @@ from pathlib import Path
 import os
 import time
 
+from . import frame_preview
+from .macos_conditions import BLOCK_SECONDS_SCOPE, runtime_conditions
+from .sampling_progress import SamplingProgress
+
+
+class MacSamplingProgress(SamplingProgress):
+    """Retain every existing host block-start callback, including throttled events."""
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.block_seconds = []
+        self.conditions = []
+        self._block_started = None
+        self._blocks = []
+
+    def start(self):
+        self.conditions.append(runtime_conditions())
+        super().start()
+
+    def layer(self, index):
+        if len(self.completed) >= self.steps:
+            return
+        now = self.clock()
+        if self._block_started is not None:
+            self._blocks.append(round(now - self._block_started, 2))
+        self._block_started = now
+        super().layer(index)
+
+    def complete(self, seconds):
+        now = self.clock()
+        if self._block_started is not None:
+            self._blocks.append(round(now - self._block_started, 2))
+        self.block_seconds.append(self._blocks)
+        self._blocks, self._block_started = [], None
+        self.conditions.append(runtime_conditions())
+        super().complete(seconds)
+
 
 def upscale_latents(video, sampling, base, backend, checkpoint=None):
     """The same learned upscale/crop for resident and process-separated stages."""
     import torch
     from .latent_upscale import upscale
     from .two_pass import UPSCALER, crop_latents
-    print(json.dumps(dict(event='latent_upscale', completed_steps=sampling['base_steps'],
-                          total=sampling['total_steps'])), flush=True)
+    from .sampling_progress import elapsed_reports
+    event = dict(event='latent_upscale', completed_steps=sampling['base_steps'], total=sampling['total_steps'])
+    print(json.dumps(event), flush=True)
     checkpoint = checkpoint or Path(base).parent / 'latent_upscaler' / Path(UPSCALER['file']).name
     tick = time.monotonic()
-    with torch.no_grad():
+    with torch.no_grad(), elapsed_reports(lambda report: print(json.dumps(report), flush=True), event):
         backend.empty_cache()
         lifted, stats = upscale(video.to('mps'), checkpoint,
             sampling['upscale_target']['width'], sampling['upscale_target']['height'], memory_saving=True)
@@ -95,7 +132,7 @@ class Engine:
                  reserve_bytes=2 * 2**30, query_chunk=128, ff_chunk=256, projection_chunk=256,
                  weight_decoder='cpu', budget_ceiling_bytes=None, attention_chunk=None, task='t2va', canvas=None,
                  head_chunk=4, window_batch=1, attention_impl='torch', fast_kernels=False,
-                 resident_bytes=0, attention_batch_bytes=1 << 29, plan_compute=False):
+                 resident_bytes=0, attention_batch_bytes=1 << 29, plan_compute=False, memory_retry=False):
         attention_chunk = projection_chunk if attention_chunk is None else attention_chunk
         if type(attention_chunk) is not int or attention_chunk < 1:
             raise ValueError('MPS attention row chunk must be a positive integer')
@@ -106,9 +143,11 @@ class Engine:
             raise ValueError('Native window attention must use torch or mlx')
         if type(resident_bytes) is not int or resident_bytes < 0:
             raise ValueError('MPS retained layer bytes must be a nonnegative integer')
-        if type(plan_compute) is not bool:
+        if type(plan_compute) is not bool or type(memory_retry) is not bool:
             raise ValueError('MPS compute planning must be explicitly enabled or disabled')
-        self.plan_compute, self.compute = plan_compute, None
+        # A stage retried after running out of unified memory plans its smallest,
+        # grouped-projection partitions whatever the fresh allowance suggests.
+        self.plan_compute, self.memory_retry, self.compute = plan_compute, memory_retry, None
         self._ff_originals = []
         self._block_originals = []
         self.block_policy = None
@@ -292,8 +331,8 @@ class Engine:
     def _bind_attention(self, *, head_chunk, row_chunk, ff_chunk, bounded=False):
         """Bind one phase's attention and owned-buffer policy as a unit.
 
-        Automatic planning currently never enables the bounded candidate. Its
-        explicit binding is available for complete native acceptance. Validate
+        Planning enables the bounded candidate only where the smallest original
+        partition does not fit, or for a memory retry (macos_compute.plan). Validate
         the block contract before changing attention, and restore the captured
         upstream block methods when returning to the reference path.
         """
@@ -401,7 +440,8 @@ class Engine:
         from .backends.mps_linear import install as install_linear
         rows = sequence_tokens(canvas, prompt_rows)
         computed = plan(self.policy['effective_allocator_limit_bytes'], rows['total'],
-                        frames=canvas['latent_frames'], layers=len(self.model.transformer_blocks))
+                        frames=canvas['latent_frames'], layers=len(self.model.transformer_blocks),
+                        allow_bounded=True, force_bounded=getattr(self, 'memory_retry', False))
         computed.update(tokens=rows['total'], packed_rows=rows, frames=canvas['latent_frames'],
                         admission='enforced allocator cap, after conditioning; before sampling')
         for module, original in self._ff_originals:
@@ -450,7 +490,6 @@ class Engine:
                initial_latents=None, refine_steps=None, refine_schedule=None):
         import torch
         from .geometry import geometry, sampler_for_canvas
-        from .sampling_progress import SamplingProgress
         from .system import system_memory
         from src.inference.render import generate_latents
         if self.closed:
@@ -481,7 +520,7 @@ class Engine:
         active_steps = refine_steps if refining else self.steps
         canvas = geometry(width, height, frames=frames)
         sampler = sampler_for_canvas(generate_latents, width, height)
-        progress = SamplingProgress(active_steps, len(self.model.transformer_blocks),
+        progress = MacSamplingProgress(active_steps, len(self.model.transformer_blocks),
                                     offset=progress_offset, total=progress_total)
         class StepTimes(list):
             def append(owner, duration):
@@ -517,7 +556,10 @@ class Engine:
                 sampling_specs = [row for row in self.specs
                                   if not row[2].startswith('token_refiner.refiner_blocks.')]
                 with self._sampling_weights(sampling_specs, retention) as residency, \
-                        progress.layers(self.model.transformer_blocks):
+                        progress.layers(self.model.transformer_blocks), \
+                        frame_preview.observing(latent_frames=canvas['latent_frames'], frame_h=height // 32,
+                                                frame_w=width // 32, step_offset=progress_offset,
+                                                total=progress_total if progress_total is not None else active_steps):
                     self.residency = residency
                     video, audio = sampler(self.model, prompt, tags, canvas['frames'], self.steps,
                                           seed, 'mps', step_seconds=durations,
@@ -547,6 +589,8 @@ class Engine:
                         attention_calls={name: value - previous_calls[name]
                                          for name, value in self.attention.backend_calls.items()},
                         step_seconds=list(durations),
+                        block_seconds=progress.block_seconds, block_seconds_scope=BLOCK_SECONDS_SCOPE,
+                        conditions=progress.conditions,
                         load_seconds=self.load_seconds, residency=self._residency_metrics(residency, previous_residency),
                         text_refiner_residency=text_residency,
                         residency_scope='Repeated video blocks; one-use prompt weights reported separately',
@@ -561,7 +605,7 @@ class Engine:
 
     def generate(self, conditioning, seed, *, width, height, frames, two_pass=True, refine_steps=3,
                  upscaler_checkpoint=None, first_pass_saved=None, reuse_weights=False,
-                 refinement_resident_bytes=None, phase_changed=None):
+                 refinement_resident_bytes=None, phase_changed=None, staged=False):
         """Optional cross-pass weight lifetime, isolated to this one request.
 
         Product admission remains separate. Retention obeys each sample's live
@@ -578,7 +622,7 @@ class Engine:
         options = dict(width=width, height=height, frames=frames, two_pass=two_pass,
                        refine_steps=refine_steps, upscaler_checkpoint=upscaler_checkpoint,
                        first_pass_saved=first_pass_saved, phase_changed=phase_changed,
-                       refinement_resident_bytes=refinement_resident_bytes)
+                       refinement_resident_bytes=refinement_resident_bytes, staged=staged)
         if getattr(self, '_reuse_sampling_weights', False) or getattr(self, '_shared_residency', None) is not None:
             raise RuntimeError('Native sampling weight lifetimes cannot overlap')
         if not reuse_weights:
@@ -596,7 +640,7 @@ class Engine:
 
     def _generate(self, conditioning, seed, *, width, height, frames, two_pass=True, refine_steps=3,
                   upscaler_checkpoint=None, first_pass_saved=None,
-                  refinement_resident_bytes=None, phase_changed=None):
+                  refinement_resident_bytes=None, phase_changed=None, staged=False):
         """Use the shared canvas/schedule, including the original audio clock.
 
         Single-pass behavior remains explicit; memory pressure never disables
@@ -610,7 +654,7 @@ class Engine:
         if self.canvas is not None and any(canvas[k] != self.canvas[k] for k in ('width', 'height', 'frames')):
             raise ValueError('Native generation differs from its loaded target canvas')
         sampling = plan(canvas, enabled=two_pass, task=self.task,
-                        base_steps=self.steps, refine_steps=refine_steps)
+                        base_steps=self.steps, refine_steps=refine_steps, staged=staged)
         if phase_changed is not None:
             phase_changed('first-pass')
         video, audio, first = self.sample(conditioning, seed, **sampling['first'],

@@ -6,11 +6,29 @@ completion measurements.
 """
 from contextlib import contextmanager
 import json
+import threading
 import time
 
 
 def emit_event(event):
     print(json.dumps(event), flush=True)
+
+
+@contextmanager
+def elapsed_reports(emit, fields, *, interval=3., clock=time.perf_counter):
+    """Report `step_elapsed_seconds` every `interval` seconds while a stage with
+    no internal counters (the latent upscale) runs in the calling thread."""
+    started, stopped = clock(), threading.Event()
+    def report():
+        while not stopped.wait(interval):
+            emit(dict(fields, step_elapsed_seconds=clock() - started))
+    thread = threading.Thread(target=report, name='stage-elapsed-reports', daemon=True)
+    thread.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        thread.join(timeout=1.)
 
 
 def _bounded(value, low=0., high=1.):
@@ -35,6 +53,9 @@ class SamplingProgress:
         self.step_started = self.started
         self.completed = []
         self.last_layer_event = float('-inf')
+        # When the current step entered its first layer. Input preparation and
+        # model reacquisition before it are not layer time.
+        self.first_layer_at = None
 
     def _step_estimate(self):
         # The first step includes input preparation and kernel compilation. A
@@ -68,19 +89,28 @@ class SamplingProgress:
 
     def start(self):
         self.event('sampling_start', stage='inputs', step=1)
+        # Preparation can encounter a new shape or a cold compiler cache. We
+        # cannot tell whether a compile is active, or how far it has progressed.
+        self.event('sampling_prepare', stage='kernel_prepare', step=1)
 
     def layer(self, index):
         if len(self.completed) >= self.steps:
             return
         now = self.clock()
+        if index == 1:
+            self.first_layer_at = now
         if index == 1 or now-self.last_layer_event >= 1.:
             self.last_layer_event = now
             estimate = self._visual_step_estimate()
             # A layer event is emitted before that layer runs. Once the next
-            # layer is entered, the elapsed time covers the preceding layers;
-            # use that fraction as an early, continuously corrected ruler.
-            if estimate is None and index > 1 and self.blocks > 0:
-                elapsed = now - self.step_started
+            # layer is entered, the time since the first layer was entered is
+            # the measured duration of the preceding layers; use that fraction
+            # as an early, continuously corrected ruler. Nothing is shown
+            # before the first layer has really run: time spent preparing the
+            # step's inputs would otherwise inflate the first estimate many
+            # times over.
+            if estimate is None and index > 1 and self.blocks > 0 and self.first_layer_at is not None:
+                elapsed = now - self.first_layer_at
                 fraction = (index - 1) / self.blocks
                 if elapsed > 0 and fraction > 0:
                     estimate = elapsed / fraction
@@ -104,6 +134,7 @@ class SamplingProgress:
                    # elapsed time into the next one.
                    next_step_elapsed_seconds=0.)
         self.step_started = self.clock()
+        self.first_layer_at = None
 
     @contextmanager
     def layers(self, blocks):
@@ -132,6 +163,15 @@ def progress_message(event):
             return dict(label=labels[phase], phase='sample_finalize', stage=phase,
                         done=0, total=0)
         return None
+    if name == 'sampling_prepare':
+        done, total = event.get('completed_steps'), event.get('total')
+        if type(total) is not int or total < 1 or type(done) is not int or not 0 <= done < total:
+            return None
+        return dict(label='Preparing GPU programs for the first step', phase='sampling',
+                    stage='kernel_prepare', done=done, total=total, unit='steps',
+                    kernel_cache_note=True,
+                    uniform_remaining_steps=event.get('uniform_remaining_steps', True),
+                    step_elapsed_seconds=event.get('step_elapsed_seconds', 0.))
     if name not in ('sampling_start', 'sampling_progress', 'step', 'loaded'):
         return None
     total = event.get('total', 8)
@@ -157,7 +197,7 @@ def progress_message(event):
             display_fraction = _bounded((done + local) / total, high=1.)
             estimated = True
             result.update(block=block, blocks=blocks,
-                          detail='Step %d · processing layer %d / %d' % (done+1, block, blocks))
+                          detail='Step %d of %d' % (done+1, total))
     elif name == 'step':
         result.update(stage='complete' if done == total else 'between_steps',
                       detail='Sampling complete · preparing output' if done == total else

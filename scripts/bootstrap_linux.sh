@@ -9,6 +9,30 @@ FV_PYTHON_VERSION=3.12.3
 fv_note() { printf 'FreeVideo: %s\n' "$*" >&2; }
 fv_fail() { fv_note "$*"; return 1; }
 
+# Match network.slow_download_failure: unavailable artifacts and local errors
+# may try another source, but must not earn a longer download round.
+fv_slow_download_failure() {
+    # Keep in sync with slow_download_failure in freevideo_engine/network.py.
+    # Only a validation failure blocks the slow retry: a package or service
+    # with "checksum" in its name is still a plain network failure.
+    local detail="${1,,}" sp='[[:space:]]+' edge='(^|[^[:alnum:]_])' q="'"
+    while [[ "$detail" =~ https?://[^[:space:]]+ ]]; do detail=${detail//"${BASH_REMATCH[0]}"/}; done
+    local aux="(does${sp}not|doesn${q}t|did${sp}not|didn${q}t|do${sp}not|don${q}t)" end='($|[^[:alnum:]_])'
+    local integrity="${edge}(invalid|bad|wrong|incorrect|mismatched?)${sp}checksums?${end}"
+    integrity+="|${edge}checksums?${sp}(mismatch|error|failed|failure)${end}"
+    integrity+="|${edge}checksums?${sp}(verification|validation)${sp}(failed|failure|error)${end}"
+    integrity+="|${edge}checksums?${sp}${aux}${sp}match${end}"
+    integrity+="|${edge}${aux}${sp}match${sp}(the${sp}|its${sp}|expected${sp})?(checksums?|hash(es)?)${end}"
+    integrity+="|${edge}hash${sp}(mismatch|check${sp}failed|does${sp}not${sp}match)${end}"
+    integrity+="|${edge}hashes${sp}(do${sp}not|didn${q}t)${sp}match${end}"
+    integrity+="|${edge}(sha-?256|digest)${sp}mismatch${end}"
+    integrity+="|${edge}integrity${sp}(check|verification)${sp}failed${end}"
+    [[ "$detail" =~ timed\ out|timeout|connection|could\ not\ resolve|failed\ to\ download|failed\ to\ fetch|network\ is\ unreachable|ssl|tls|http\ status|status\ code|requested\ url\ returned\ error|rpc\ failed|early\ eof|unable\ to\ access|remote\ end\ hung\ up|couldn\'t\ connect|proxy ]] &&
+    [[ ! "$detail" =~ (^|[^[:alnum:]_])(401|403|404|410)($|[^[:alnum:]_]) ]] &&
+    [[ ! "$detail" =~ $integrity ]] &&
+    [[ ! "$detail" =~ no\ solution\ found|no\ matching\ distribution|could\ not\ find\ a\ version|certificate\ verify\ failed|certificate_verify_failed|invalid\ peer\ certificate|unknown\ issuer|not\ found|resolutionimpossible|failed\ to\ build|invalid\ wheel|permission\ denied|no\ space\ left\ on\ device|disk\ full ]]
+}
+
 fv_python_ok() {
     [[ -n "$1" ]] && command -v -- "$1" >/dev/null 2>&1 &&
         "$1" -I -B -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1
@@ -36,9 +60,11 @@ fv_help() {
     cat <<'EOF'
 FreeVideo Linux launcher
 
-  ./setup.sh              Detect missing tools, prepare Python, then review installation
+  ./setup.sh              Install FreeVideo and ComfyUI, then open FreeVideo in the browser
+  ./freevideo             Open FreeVideo again (starts ComfyUI in the background if needed)
+  ./freevideo server      Keep FreeVideo running for other computers; see ./freevideo server --help
+  ./freevideo stop        Stop ComfyUI; ./freevideo status shows whether it runs
   ./test.sh               Generate and retain videos, timings and memory reports
-  ./freevideo optimize    Validate lightweight tuning from the previous test
   ./freevideo diagnose    Export a small local diagnostic ZIP
 
 Setup launcher options:
@@ -50,6 +76,7 @@ Setup launcher options:
   --network official      Upstream sources only; compare proxy/direct connections
   --model-downloader xet   Require HF Xet for large weights; stop instead of falling back
   --reuse-models PATH      Verify and reuse compatible models in an existing folder
+  --no-launch              Stop after the engine; do not install ComfyUI or open FreeVideo
 
 No Python, pip, virtual environment or CUDA toolkit installation is needed beforehand.
 Default installation: this checkout's directory (independent of the current directory).
@@ -219,6 +246,12 @@ fv_install_python() (
     fv_note "Files and log: $FREEVIDEO_BOOTSTRAP_ROOT"
     fv_download_uv || exit 1
     local uv="$FREEVIDEO_BOOTSTRAP_ROOT/tools/uv-x86_64-unknown-linux-gnu/uv" source route attempt=0
+    local retry_mode timeout retries attempt_log attempt_dir attempt_detail python_exit tee_exit all_network_failures=1
+    local -a pipe_status
+    # The capture only classifies failures: without a writable place for it the
+    # install still runs, it just never starts the slow-network round.
+    attempt_dir=$(mktemp -d 2>/dev/null) || attempt_dir=$(mktemp -d "$FREEVIDEO_BOOTSTRAP_ROOT/.attempt.XXXXXX" 2>/dev/null) || attempt_dir=''
+    trap '[[ -z "$attempt_dir" ]] || rm -rf -- "$attempt_dir"' EXIT
     local -a fv_routes=()
     fv_proxy_routes
     local -a sources=(https://github.com/astral-sh/python-build-standalone/releases/download)
@@ -228,17 +261,53 @@ fv_install_python() (
         sources+=(https://ghfast.top/https://github.com/astral-sh/python-build-standalone/releases/download)
     fi
     export UV_PYTHON_INSTALL_DIR="$FREEVIDEO_BOOTSTRAP_ROOT/python" UV_CACHE_DIR="$FREEVIDEO_BOOTSTRAP_ROOT/cache"
-    export UV_HTTP_TIMEOUT=20 UV_HTTP_RETRIES=1
-    for source in "${sources[@]}"; do
-      for route in "${fv_routes[@]}"; do
-        ((attempt+=1))
-        fv_note "Installing private Python, attempt $attempt ($route connection)…"
-        printf 'Python source %s\n' "$attempt" >>"$FREEVIDEO_BOOTSTRAP_ROOT/bootstrap.log"
-        if UV_PYTHON_INSTALL_MIRROR="$source" fv_with_route "$route" "$uv" --no-config python install --no-bin --no-registry \
-            --no-progress --color never "$FV_PYTHON_VERSION" >>"$FREEVIDEO_BOOTSTRAP_ROOT/bootstrap.log" 2>&1; then
-            fv_python_ok "$UV_PYTHON_INSTALL_DIR/cpython-$FV_PYTHON_VERSION-linux-x86_64-gnu/bin/python3.12" && exit 0
-        fi
-        fv_note 'Python preparation failed; retrying the next source. Existing files retained.'
+    # Keep these defaults and the notice in sync with network.py (CPU tests).
+    for retry_mode in fast patient; do
+      timeout=20 retries=1
+      if [[ "$retry_mode" == patient ]]; then
+        (( all_network_failures )) || break
+        timeout=120 retries=5
+        fv_note 'The network is slow. Downloading again; this may take a while.'
+      fi
+      for source in "${sources[@]}"; do
+        for route in "${fv_routes[@]}"; do
+          ((attempt+=1))
+          fv_note "Installing private Python, attempt $attempt ($route connection)…"
+          if [[ "$retry_mode" == patient ]]; then
+              printf 'Python source %s (%s)\n' "$attempt" "$retry_mode" >>"$FREEVIDEO_BOOTSTRAP_ROOT/bootstrap.log"
+          else
+              printf 'Python source %s\n' "$attempt" >>"$FREEVIDEO_BOOTSTRAP_ROOT/bootstrap.log"
+          fi
+          attempt_log=''
+          [[ -z "$attempt_dir" ]] || attempt_log=$(mktemp "$attempt_dir/output.XXXXXX" 2>/dev/null) || attempt_log=''
+          # Command-local defaults never turn our fast values into user settings.
+          # Classify this attempt independently of main-log truncation/rotation.
+          if UV_HTTP_TIMEOUT="${UV_HTTP_TIMEOUT-$timeout}" UV_HTTP_RETRIES="${UV_HTTP_RETRIES-$retries}" \
+              UV_PYTHON_INSTALL_MIRROR="$source" fv_with_route "$route" "$uv" --no-config python install --no-bin --no-registry \
+              --no-progress --color never "$FV_PYTHON_VERSION" 2>&1 | \
+              tee -a -- "${attempt_log:-/dev/null}" >>"$FREEVIDEO_BOOTSTRAP_ROOT/bootstrap.log"; then
+              pipe_status=("${PIPESTATUS[@]}")
+          else
+              pipe_status=("${PIPESTATUS[@]}")
+          fi
+          python_exit=${pipe_status[0]} tee_exit=${pipe_status[1]:-0}
+          attempt_detail=''
+          [[ -z "$attempt_log" ]] || attempt_detail=$(tail -n 12 -- "$attempt_log")
+          [[ -z "$attempt_log" ]] || rm -f -- "$attempt_log"
+          if (( tee_exit != 0 )); then
+              # The main log could not take the output: keep what uv said on screen.
+              [[ -z "$attempt_detail" ]] || printf '%s\n' "$attempt_detail" >&2
+              fv_fail "Could not retain Python installation output. Check $FREEVIDEO_BOOTSTRAP_ROOT/bootstrap.log and retry the same command."
+              exit 1
+          fi
+          if (( python_exit == 0 )); then
+              fv_python_ok "$UV_PYTHON_INSTALL_DIR/cpython-$FV_PYTHON_VERSION-linux-x86_64-gnu/bin/python3.12" && exit 0
+              all_network_failures=0
+          elif ! fv_slow_download_failure "$attempt_detail"; then
+              all_network_failures=0
+          fi
+          fv_note 'Python preparation failed; retrying the next source. Existing files retained.'
+        done
       done
     done
     fv_fail "Could not prepare Python. Check $FREEVIDEO_BOOTSTRAP_ROOT/bootstrap.log and retry the same command."
@@ -279,7 +348,11 @@ freevideo_bootstrap_linux() {
     export FREEVIDEO_HOME="$fv_root"
     export FREEVIDEO_BOOTSTRAP_ROOT="${FREEVIDEO_BOOTSTRAP_ROOT:-$fv_root/.freevideo/bootstrap}"
     [[ "$mode" != cli || "$command_name" != setup ]] || mode=setup
-    [[ "$mode" != cli || -n "$command_name" ]] || help=1
+    # ./freevideo alone opens an installed FreeVideo. Before ./setup.sh it only
+    # shows how to install: nothing is downloaded without that explicit step.
+    if [[ "$mode" == cli && -z "$command_name" ]] && (( ! help )); then
+        if [[ -f "$fv_root/machine.json" ]]; then command_name=open; FREEVIDEO_BOOTSTRAP_ARGS+=(open); else help=1; fi
+    fi
     if (( bootstrap_only || fv_allow_system )) && [[ "$mode" != setup ]]; then
         fv_fail '--bootstrap-only and --install-system-deps are setup options.'; return 1
     fi

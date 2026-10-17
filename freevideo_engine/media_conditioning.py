@@ -19,7 +19,70 @@ def _tensor(value, shape, name):
     return value.detach().to(device='cpu', dtype=torch.float32).contiguous()
 
 
+def condition_at(value, step=None):
+    """None selects the second pass; an integer selects a zero-based first-pass step."""
+    selected = value
+    for stage in value.get('early_reference', {}).get('conditions', []):
+        if step is None or step >= stage['start_step']:
+            selected = stage['value']
+    return selected
+
+
 def describe(value, width, height, frames):
+    info = _describe(value, width, height, frames)
+    schedule = value.get('early_reference')
+    if schedule is None:
+        if any('early_steps' in row for row in value.get('references', [])):
+            raise ValueError('early_steps requires separately encoded early reference conditions')
+        return info
+    if (not isinstance(schedule, dict) or set(schedule) != {'version', 'early_steps', 'conditions'}
+            or type(schedule['version']) is not int or schedule['version'] != 1):
+        raise ValueError('Invalid early reference conditioning version/fields')
+    from .media_request import validate_early_steps
+    early = schedule['early_steps']
+    if not isinstance(early, list) or not early or len(early) > 32:
+        raise ValueError('Invalid early_steps metadata')
+    for row in early:
+        if not isinstance(row, dict) or set(row) != {'reference_index', 'early_steps'}:
+            raise ValueError('Invalid early_steps metadata entry')
+        validate_early_steps(dict(row, kind='video'))
+        if type(row['reference_index']) is not int or not 0 <= row['reference_index'] < 32:
+            raise ValueError('Invalid early reference index')
+    if len({row['reference_index'] for row in early}) != len(early):
+        raise ValueError('Duplicate early reference index')
+    if sorted(row['early_steps'] for row in early if row['early_steps']) != sorted(
+            row['early_steps'] for row in value.get('references', []) if 'early_steps' in row):
+        raise ValueError('Early reference metadata disagrees with active video references')
+    stages = schedule['conditions']
+    expected = sorted({row['early_steps'] for row in early if row['early_steps'] > 0})
+    if not isinstance(stages, list) or any(not isinstance(row, dict) or set(row) != {'start_step', 'value'} for row in stages):
+        raise ValueError('Invalid early reference conditions')
+    if [row['start_step'] for row in stages] != expected or any(type(row['start_step']) is not int for row in stages):
+        raise ValueError('Early reference boundaries disagree with early_steps')
+    counts = [dict(start_step=0, **info)]
+    previous = value.get('references', [])
+    for stage in stages:
+        current = stage['value']
+        if not isinstance(current, dict) or 'early_reference' in current or current.get('keyframe_anchors'):
+            raise ValueError('Invalid nested early reference condition')
+        current_info = _describe(current, width, height, frames)
+        kept = [row for row in previous if row.get('early_steps', stage['start_step'] + 1) > stage['start_step']]
+        actual = current.get('references', [])
+        if len(kept) != len(actual) or any(set(a) != set(b) or any(
+                not torch.equal(a[k], b[k]) if isinstance(a[k], torch.Tensor) else a[k] != b[k]
+                for k in a) for a, b in zip(kept, actual)):
+            raise ValueError('Early reference conditions must retain exactly the remaining references')
+        previous = actual
+        counts.append(dict(start_step=stage['start_step'], **current_info))
+    for name in ('text_tokens', 'reference_video_tokens', 'reference_audio_tokens'):
+        info[name] = max(row[name] for row in counts)
+    for index, row in enumerate(counts):
+        row['condition'] = 'base' if index == len(counts) - 1 else 'full' if index == 0 else 'after_' + str(row['start_step'])
+    info['early_reference'] = dict(early_steps=early, conditions=counts)
+    return info
+
+
+def _describe(value, width, height, frames):
     task = value.get('task', 'fl2va' if value.get('keyframe_anchors') else 't2va')
     prompt, tags = value['prompt_embeds'], value['text_token_tags']
     refs = value.get('references', [])
@@ -38,6 +101,9 @@ def describe(value, width, height, frames):
     video_rows = audio_rows = 0
     for ref in refs:
         kind = ref.get('kind')
+        if 'early_steps' in ref:
+            from .media_request import validate_early_steps
+            validate_early_steps(ref)
         if kind not in ('image', 'video', 'audio'):
             raise ValueError('Unknown reference modality')
         if kind in ('image', 'video'):

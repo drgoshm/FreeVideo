@@ -34,7 +34,7 @@ def reference_size(width, height, canvas):
     return max(32, round(width * scale / 32) * 32), max(32, round(height * scale / 32) * 32)
 
 
-def encode_visual(vae, pixels, *, device='cuda'):
+def encode_visual(vae, pixels, *, device='cuda', posterior='sample'):
     """The pinned VAE chunk/padding/posterior recipe with one live pixel chunk.
 
     Posterior sampling still occurs once on the original device with seed 42;
@@ -58,7 +58,9 @@ def encode_visual(vae, pixels, *, device='cuda'):
     moments = torch.cat(moments, dim=2).to(device)
     if len(pixels) > 1 and vae.config.token_drop:
         moments = moments[:, :, :-vae.config.token_drop]
-    latent = DiagonalGaussianDistribution(moments).sample(generator=torch.Generator().manual_seed(42))
+    distribution = DiagonalGaussianDistribution(moments)
+    # References keep the pipeline's seeded sample; a continuation context wants the picture itself.
+    latent = distribution.mode() if posterior == 'mode' else distribution.sample(generator=torch.Generator().manual_seed(42))
     latent = latent.to(torch.float16).float().cpu()
     mean = torch.tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1)
     std = torch.tensor(vae.config.latents_std).view(1, -1, 1, 1, 1)
@@ -131,6 +133,8 @@ def prepare(media, canvas, directory):
     for index, row in enumerate(media.get('references', [])):
         kind, path = row['kind'], row['path']
         ref = {'kind': kind}
+        if 'early_steps' in row:
+            ref['early_steps'] = row['early_steps']
         numbers[kind] += 1
         longer, length, used = False, None, limit / 24.
         target = directory / ('reference-%02d.npy' % index)
@@ -174,7 +178,7 @@ def prepare(media, canvas, directory):
                 del previous
                 count = count - (count - 5) % 17
                 if count < 22:
-                    raise ValueError('Reference video needs at least 22 normalized frames for H3/Qwen temporal encoding')
+                    raise ValueError('The reference video is too short; it needs to be at least about 1 s long.')
                 pixels.flush()
                 ref.update(pixels=str(target), frames=count, normalized_fps=24)
                 used = count / 24.
@@ -202,6 +206,17 @@ def prepare(media, canvas, directory):
     return result, {'images': key_images} if key_images else {'minimax_ref_items': ref_items} if ref_items else {}
 
 
+def reference_options(normalized, options, step):
+    """Filter whole references, including a video's optional audio presentation."""
+    items, offset = [], 0
+    for row in normalized:
+        count = 1 + int(row['kind'] == 'video' and bool(row.get('audio')))
+        if 'early_steps' not in row or step < row['early_steps']:
+            items.extend(options['minimax_ref_items'][offset:offset + count])
+        offset += count
+    return {'minimax_ref_items': items} if items else {}
+
+
 def encode_latents(normalized, value, base, canvas, *, resident=None, device='cuda'):
     import gc
     import numpy as np
@@ -212,7 +227,7 @@ def encode_latents(normalized, value, base, canvas, *, resident=None, device='cu
     if torch.device(device).type not in ('cuda', 'mps'):
         raise ValueError('Media encoding requires a CUDA or MPS device')
     empty_cache = torch.mps.empty_cache if torch.device(device).type == 'mps' else torch.cuda.empty_cache
-    refs = [{'kind': row['kind']} for row in normalized]
+    refs = [{key: row[key] for key in ('kind', 'early_steps') if key in row} for row in normalized]
     if any(row.get('pixels') for row in normalized):
         print(json.dumps({'event': 'media_encode_phase', 'phase': 'Encoding image/video references'}), flush=True)
         # Conditioning never decodes: the 9.0 GiB decoder in the shared shards
@@ -263,5 +278,9 @@ def encode_latents(normalized, value, base, canvas, *, resident=None, device='cu
                      condition_latents=[row['latent'] for row in refs])
     else:
         value['references'] = refs
+        for stage in value.get('early_reference', {}).get('conditions', []):
+            remaining = [ref for ref in refs if 'early_steps' not in ref or stage['start_step'] < ref['early_steps']]
+            if remaining:
+                stage['value']['references'] = remaining
     from .media_conditioning import describe
     return describe(value, canvas['width'], canvas['height'], canvas['frames'])

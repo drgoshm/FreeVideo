@@ -1,6 +1,36 @@
 // ComfyUI owns execution. This controller only submits frozen workflows and
 // replenishes a loop after its previous request has actually completed.
+import {fetchQueueRead, detectBrowserExtension} from './browser_extension.js';
 const clone = value => structuredClone(value);
+
+// ComfyUI leaves a muted (2) or bypassed (4) node out of the request. The creation panel is where
+// the node is used, so a request from it turns the node back on; true when it was off.
+export function enableNode(node) {
+    // Every request that wants the node on takes over from an earlier request's claim on its mode,
+    // whether or not the node still needs switching.
+    if (node) node.freevideoNodeOn = null;
+    if (node?.mode !== 2 && node?.mode !== 4) return false;
+    node.mode = 0;
+    node.graph?.change?.(); node.setDirtyCanvas?.(true, true);
+    return true;
+}
+
+// Like enableNode, for a request that may still fail: restore() puts the user's mode back, but only
+// if nothing else has touched the node since (a hand edit, another request) and only once.
+export function turnNodeOn(node) {
+    const prior = node?.mode;
+    if (!enableNode(node)) return null;
+    const token = node.freevideoNodeOn = {};
+    const release = () => { if (node.freevideoNodeOn === token) { node.freevideoNodeOn = null; return true; } return false; };
+    return {
+        done: release,
+        restore() {
+            if (!release() || node.mode !== 0) return;
+            node.mode = prior;
+            node.graph?.change?.(); node.setDirtyCanvas?.(true, true);
+        },
+    };
+}
 
 // Repeat the completed request, not an editor draft changed while it was running.
 // Comfy's local history owns the prompt/media graph; no new server endpoint.
@@ -9,9 +39,12 @@ export async function regenerateResult(api, nodeId, result, currentPrompt) {
     const path = result.request_id ? '/history/' + encodeURIComponent(result.request_id) : '/history?max_items=64';
     let rows = [];
     try {
-        const response = await api.fetchApi(path);
+        const response = await fetchQueueRead(api, path);
         if (response.ok) rows = Object.values(await response.json());
-    } catch { /* Cleared/unavailable history is an ordinary new generation. */ }
+    } catch (error) {
+        if (detectBrowserExtension(error)) throw error;
+        /* Cleared/unavailable history is an ordinary new generation. */
+    }
     rows.sort((a, b) => (b.prompt?.[0] || 0) - (a.prompt?.[0] || 0));
     const saved = rows.find(row => row.outputs?.[nodeId]?.freevideo_summary?.[0]?.video === result.video
         && row.outputs[nodeId].freevideo_summary[0].result_cache_hit === true
@@ -35,9 +68,12 @@ export async function upscaleResult(api, nodeId, result, currentPrompt) {
     const path = result.request_id ? '/history/' + encodeURIComponent(result.request_id) : '/history?max_items=64';
     let rows = [];
     try {
-        const response = await api.fetchApi(path);
+        const response = await fetchQueueRead(api, path);
         if (response.ok) rows = Object.values(await response.json());
-    } catch { /* Cleared/unavailable history: the bridge still uses the preview's request. */ }
+    } catch (error) {
+        if (detectBrowserExtension(error)) throw error;
+        /* Cleared/unavailable history: the bridge still uses the preview's request. */
+    }
     rows.sort((a, b) => (b.prompt?.[0] || 0) - (a.prompt?.[0] || 0));
     const saved = rows.find(row => row.outputs?.[nodeId]?.freevideo_summary?.[0]?.video === result.video
         && row.status?.status_str === 'success' && row.status?.completed
@@ -51,6 +87,21 @@ export async function upscaleResult(api, nodeId, result, currentPrompt) {
     if (!reply?.prompt_id) throw new Error('submit_failed');
     api.dispatchCustomEvent?.('promptQueued', {number: 0, batchCount: 1});
     return reply.prompt_id;
+}
+
+// Each preview owns its submission outcome; another preview waits its turn.
+// Only duplicate clicks for the same pending preview share a promise.
+export function createSecondPassQueue(api, nodeId, currentPrompt) {
+    const pending = new Map();
+    let tail = Promise.resolve();
+    return result => {
+        const key = result?.video;
+        if (pending.has(key)) return pending.get(key);
+        const request = tail.catch(() => {}).then(() => upscaleResult(api, typeof nodeId === 'function' ? nodeId() : nodeId, result, currentPrompt))
+            .finally(() => { pending.delete(key); });
+        pending.set(key, request); tail = request;
+        return request;
+    };
 }
 
 export function randomSeed() {
@@ -102,6 +153,16 @@ export function createStudioQueue(api, nodeId, {random = randomSeed, pollMs = 20
         if (!response.ok) throw new Error('cancel_failed');
         return response.json();
     }
+    // The page changes its list only after the server says where the request now is.
+    async function moveFirst(id) {
+        const response = await api.fetchApi('/freevideo/queue/first', {method: 'POST',
+            headers: {'Content-Type': 'application/json'}, body: JSON.stringify({prompt_id: id, node_id: nodeId})});
+        if (!response.ok) throw new Error('move_failed');
+        const reply = await response.json();
+        if (reply.status === 'unavailable') throw new Error('move_failed');
+        await refresh();
+        return reply;
+    }
     async function submit(session, randomized) {
         let seed = session.snapshot.output[nodeId].inputs.seed;
         if (randomized) {
@@ -120,11 +181,12 @@ export function createStudioQueue(api, nodeId, {random = randomSeed, pollMs = 20
             throw formatError(error, prompt);
         }
         remember(reply.prompt_id);
+        session.onAccepted?.();
         if (session.repeat) {
             session.waiting = reply.prompt_id;
             // Stop may be clicked while the server is acknowledging submission.
             if (!session.active) {
-                const response = await api.fetchApi('/queue');
+                const response = await fetchQueueRead(api, '/queue');
                 if (response.ok && (await response.json()).queue_pending?.some(row => row[1] === reply.prompt_id)) await cancel(reply.prompt_id);
             }
         }
@@ -135,7 +197,7 @@ export function createStudioQueue(api, nodeId, {random = randomSeed, pollMs = 20
         const session = loop;
         if (!session?.active || session.sending || !session.waiting) return;
         if (running?.id === session.waiting || pending.some(row => row.id === session.waiting)) return;
-        const response = await api.fetchApi('/history/' + encodeURIComponent(session.waiting));
+        const response = await fetchQueueRead(api, '/history/' + encodeURIComponent(session.waiting));
         if (!response.ok) throw new Error('queue_unavailable');
         const history = (await response.json())[session.waiting];
         if (loop !== session || !session.active) return;
@@ -150,11 +212,12 @@ export function createStudioQueue(api, nodeId, {random = randomSeed, pollMs = 20
         finally { session.sending = false; }
     }
     async function readQueue() {
-        const response = await api.fetchApi('/queue');
+        const response = await fetchQueueRead(api, '/queue');
         if (!response.ok) throw new Error('queue_unavailable');
         const queue = await response.json();
         running = (queue.queue_running || []).filter(matches).map(entry)[0] || null;
-        pending = (queue.queue_pending || []).filter(matches).map(entry);
+        // Comfy returns its heap array; the queue number gives the real running order.
+        pending = (queue.queue_pending || []).filter(matches).sort((a, b) => a[0] - b[0]).map(entry);
         for (const row of [running, ...pending]) if (row) remember(row.id);
         await advanceLoop(); publish();
     }
@@ -166,13 +229,13 @@ export function createStudioQueue(api, nodeId, {random = randomSeed, pollMs = 20
         })().catch(error => { fail(error); throw error; }).finally(() => { refreshing = null; schedule(); });
         return refreshing;
     }
-    async function start(snapshot, {count = 1, repeat = false, seedIndex = -1} = {}) {
+    async function start(snapshot, {count = 1, repeat = false, seedIndex = -1, onAccepted = null} = {}) {
         if (submitting) throw new Error('submitting');
         if (!Number.isInteger(count) || count < 1 || count > 100) throw new Error('invalid_count');
         if (repeat && loop?.active) throw new Error('loop_active');
         if (!snapshot.output?.[nodeId]) throw new Error('missing_node');
         if ((repeat || count > 1) && !Number.isSafeInteger(snapshot.output[nodeId].inputs.seed)) throw new Error('linked_seed');
-        const session = {snapshot: clone(snapshot), seedIndex, repeat, active: repeat, completed: 0, waiting: null, sending: true};
+        const session = {snapshot: clone(snapshot), seedIndex, repeat, active: repeat, completed: 0, waiting: null, sending: true, onAccepted};
         if (repeat) loop = session;
         submitting = true; lastError = null; publish();
         try {
@@ -201,7 +264,7 @@ export function createStudioQueue(api, nodeId, {random = randomSeed, pollMs = 20
     api.addEventListener('execution_interrupted', onFailure);
     api.addEventListener('executed', onExecuted);
     return {
-        state, refresh, start, stopLoop,
+        state, refresh, start, stopLoop, moveFirst,
         subscribe(listener) { listeners.add(listener); listener(state()); schedule(); return () => { listeners.delete(listener); schedule(); }; },
         async cancel(id) {
             if (loop?.waiting === id) { loop.active = false; publish(); }

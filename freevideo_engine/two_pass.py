@@ -22,12 +22,90 @@ def validate_steps(base_steps=8, refine_steps=3, enabled=True):
         raise ValueError('Second-pass steps must be fewer than first-pass steps')
 
 
-def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3):
+# The learned latent lift and the three refinement steps were built and checked
+# for the 8-step first pass only. Any other first-pass count runs in one pass.
+TWO_PASS_BASE_STEPS = 8
+
+
+def one_pass_note(base_steps):
+    """The sentence a request gets when its step count rules out two-pass, else None."""
+    if base_steps == TWO_PASS_BASE_STEPS:
+        return None
+    return ('Two-pass generation runs only with %d first-pass steps; this request runs in one pass of %d step%s.'
+            % (TWO_PASS_BASE_STEPS, base_steps, '' if base_steps == 1 else 's'))
+
+
+# A first pass below this many pixels is too small for the learned lift: about
+# a third of the clips at 768x512 and every clip at 512x512 had coloured
+# bursts, and none did from 480x288 (960x544) upward. Those sizes run in one pass.
+SMALL_FIRST_PASS_PIXELS = 138240
+
+
+# A requested size below this many pixels shows the same bursts in any pass
+# layout. Such a request is rendered at a larger size of nearly the same shape
+# and scaled down to the size asked for.
+SMALL_TARGET_PIXELS = 131072
+# How far the rendered shape may differ from the requested one; the rendered
+# frames are centre-cropped to the requested shape before scaling.
+RENDER_SHAPE_TOLERANCE = 0.03
+
+
+def render_size(width, height):
+    """Return (width, height) to render for a small requested size, else None.
+
+    The smallest multiple-of-32 size of at least SMALL_FIRST_PASS_PIXELS whose
+    shape is within RENDER_SHAPE_TOLERANCE of the requested shape.
+    """
+    from math import log
+    from .geometry import geometry
+    geometry(width, height)
+    if width * height >= SMALL_TARGET_PIXELS:
+        return None
+    wanted = log(width / height)
+    best = None
+    for rw in range(256, 4097, 32):
+        for rh in range(256, 4097, 32):
+            pixels = rw * rh
+            if pixels < SMALL_FIRST_PASS_PIXELS:
+                continue
+            if best is not None and pixels > best[0]:
+                break
+            error = abs(log(rw / rh) - wanted)
+            if error <= RENDER_SHAPE_TOLERANCE and (best is None or (pixels, error) < best[:2]):
+                best = (pixels, error, rw, rh)
+    return best[2:] if best else None
+
+
+def render_canvas(canvas):
+    """Return (canvas to render, requested size or None) for a geometry() dict."""
+    render = render_size(canvas['width'], canvas['height'])
+    if render is None:
+        return canvas, None
+    from .geometry import geometry
+    larger = geometry(*render, frames=canvas['frames'])
+    return (dict(canvas, width=larger['width'], height=larger['height'], video_tokens=larger['video_tokens']),
+            dict(width=canvas['width'], height=canvas['height']))
+
+
+def sampling_canvas(canvas, *, staged=False, media=None, conditioned=False):
+    """The one place that decides what canvas a request samples.
+
+    A preview, the upscale of a preview and pre-encoded conditioning (tied to
+    the requested canvas) keep the requested size.
+    """
+    if staged or conditioned or (media or {}).get('conditioning_info'):
+        return canvas, None
+    return render_canvas(canvas)
+
+
+def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3, staged=False):
     """Align the smaller canvas, lift, center-crop, then refine at the target.
 
     Odd multiples of 32 need up to 32 extra pixels before the latent crop.
-    Small canvases use a smaller factor or same-size refinement. Size never
-    disables a requested second pass; memory pressure cannot change its math.
+    Small canvases use a smaller factor or same-size refinement. A first pass
+    below SMALL_FIRST_PASS_PIXELS is replaced by one pass at the target size,
+    unless the first pass itself is wanted (a preview or its upscale: staged).
+    Memory pressure never changes this math.
     """
     from .geometry import geometry
     from .media_request import TASKS
@@ -42,6 +120,13 @@ def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3):
     if not enabled:
         result['reason'] = 'Two-pass generation is disabled.'
         return result
+    if base_steps != TWO_PASS_BASE_STEPS:
+        if not staged:
+            single = plan(canvas, False, task, base_steps=base_steps)
+            return dict(single, requested=True, reason=one_pass_note(base_steps))
+        # A preview and its upscale keep the first pass they were made with; the
+        # receipt says so, because a replay without the flag would take the one-pass rule.
+        result['staged'] = True
     if min(target['width'], target['height']) >= 512:
         first = dict(width=((target['width'] + 63) // 64) * 32,
                      height=((target['height'] + 63) // 64) * 32, frames=target['frames'])
@@ -58,6 +143,12 @@ def plan(canvas, enabled=True, task='t2va', *, base_steps=8, refine_steps=3):
                 top=(lift['height'] - target['height']) // 2,
                 width=target['width'], height=target['height'])
     upscaling = first != lift
+    if upscaling and first['width'] * first['height'] < SMALL_FIRST_PASS_PIXELS:
+        if not staged:
+            single = plan(canvas, False, task, base_steps=base_steps)
+            return dict(single, requested=True,
+                        reason='Small canvas: one pass at the target size.')
+        result['staged'] = True
     result.update(enabled=True, mode='vdn%d-lbh-tail%d' % (base_steps, refine_steps),
                   refine_steps=refine_steps, total_steps=base_steps + refine_steps,
                   first=first, second=shape, upscale_target=lift, crop=crop,
@@ -110,6 +201,20 @@ def steps(sampling_plan=None):
 
 def same_strategy(left, right):
     """Do not mix mixed-resolution timings with ordinary full-resolution steps."""
+    def reference_schedule(value):
+        # Worker receipts add step traces and describe subsets at the smaller
+        # canvas. Neither changes the reference schedule's identity.
+        source = value.get('geometry') or value
+        schedule = source.get('early_reference', value.get('early_reference'))
+        if schedule is None:
+            return None
+        return dict(early_steps=schedule.get('early_steps'), conditions=[
+            {key: row.get(key) for key in ('start_step', 'task', 'text_tokens',
+                                         'reference_video_tokens', 'reference_audio_tokens')}
+            for row in schedule.get('conditions', [])])
+
+    if reference_schedule(left) != reference_schedule(right):
+        return False
     a, b = left.get('sampling_plan'), right.get('sampling_plan')
     try:
         if steps(a) != steps(b):
@@ -120,6 +225,59 @@ def same_strategy(left, right):
     return a == b if (a or {}).get('enabled') or (b or {}).get('enabled') else True
 
 
+def stage_tokens(canvas):
+    """Video/reference activation rows for an encoded early-reference schedule.
+
+    Counts are the scalar metadata from media_conditioning.describe, never
+    conditioning tensors. Ordinary requests retain their historical envelope.
+    The loaded engine must cover both passes; pass-local caching cannot shrink
+    its resident prefix during the first steps.
+    """
+    fields = ('reference_video_tokens', 'reference_audio_tokens')
+
+    def references(row):
+        counts = [row.get(name, 0) for name in fields]
+        if any(type(n) is not int or n < 0 for n in counts):
+            raise ValueError('Reference token counts must be nonnegative integers')
+        return sum(counts)
+
+    maximum = references(canvas)
+    full = canvas['video_tokens'] + maximum
+    schedule = canvas.get('early_reference')
+    if schedule is None:
+        return dict(first=full, refinement=full, engine=full)
+    conditions = schedule.get('conditions') if isinstance(schedule, dict) else None
+    if not isinstance(conditions, list) or not conditions or any(not isinstance(row, dict) for row in conditions):
+        raise ValueError('Early reference planning requires described condition counts')
+    starts = [row.get('start_step') for row in conditions]
+    if (any(type(n) is not int or n < 0 for n in starts) or starts[0] != 0
+            or starts != sorted(set(starts))):
+        raise ValueError('Invalid early reference planning boundaries')
+    counts = [references(row) for row in conditions]
+    if any(max(row.get(name, 0) for row in conditions) > canvas.get(name, 0) for name in fields):
+        raise ValueError('Early reference counts exceed the request allowance')
+    sampling = canvas.get('sampling_plan') or {}
+    first = canvas['video_tokens']
+    refinement = None
+    if sampling.get('enabled'):
+        steps(sampling)
+        expected = plan(canvas, task=canvas.get('task', 't2va'),
+                        base_steps=sampling['base_steps'], refine_steps=sampling['refine_steps'])
+        if any(sampling.get(key) != expected[key] for key in ('first', 'second')):
+            raise ValueError('Early reference sampling geometry disagrees with the request')
+        from .geometry import geometry
+        first = geometry(**sampling['first'])['video_tokens']
+        # Permanent image/video/audio references still participate in refinement.
+        refinement = canvas['video_tokens'] + counts[-1]
+    first += maximum
+    return dict(first=first, refinement=refinement, engine=max(first, refinement or 0))
+
+
+def placement_tokens(canvas):
+    """Shared activation envelope for fixed GPU and host placement."""
+    return stage_tokens(canvas)['engine']
+
+
 def checkpoint_path():
     """Setup's copy; an older lazily downloaded copy under models/ stays in use."""
     from .paths import installed_model_root, model_root
@@ -128,10 +286,45 @@ def checkpoint_path():
     return earlier if earlier.is_file() and not installed.is_file() else installed
 
 
+def verified_checkpoint(path):
+    """Whether setup's ledger of verified models covers this copy, unchanged since.
+
+    Every two-pass request used to hash the whole checkpoint before sampling:
+    one more full read of the file, which the upscaler then read again. The
+    ledger keeps the identity of each file whose content was hashed; a copy
+    it does not know yet is hashed once here and recorded. An unreadable
+    ledger is left alone and the caller hashes as before.
+    """
+    from .paths import data_root
+    import json
+    ledger = data_root() / 'verified-models.json'
+    try:
+        stamps = json.loads(ledger.read_text(encoding='utf-8')) if ledger.is_file() else {}
+    except (OSError, ValueError):
+        return False
+    if not isinstance(stamps, dict):
+        return False
+    from . import provision
+    # Setup records a file under its resolved folder and its own name.
+    try:
+        key = path.parent.resolve() / path.name
+        recorded = stamps.get(str(key))
+        if not provision.verified(key, dict(bytes=UPSCALER['bytes'], sha256=UPSCALER['sha256']), stamps):
+            return False
+        if stamps.get(str(key)) != recorded:
+            from .monitoring import save
+            save(ledger, stamps)
+    except OSError:
+        return False
+    return True
+
+
 def ensure_checkpoint():
     """Also upgrade existing installations lazily; retain invalid local files."""
     from .network import download, model_urls
     path = checkpoint_path()
+    if verified_checkpoint(path):
+        return path
     network = {}
     from .paths import data_root
     import json
@@ -150,6 +343,12 @@ def ensure_checkpoint():
     return path
 
 
+# Host RAM the upscaler needs beside a resident engine. latent_upscale moves
+# each checkpoint tensor (at most 13.5 MiB) to the device as it is read; this
+# covers one in flight plus the reader's buffers, with ample margin.
+UPSCALER_HOST_BYTES = 256 * 2**20
+
+
 def upscale_workspace(canvas):
     """Conservative admission estimate, not a measured capacity guarantee."""
     latent_frames = (canvas['frames'] - 5) // 17 * 5 + 2
@@ -165,12 +364,15 @@ def upscale_workspace(canvas):
 WINDOWS_PASS_CACHE_MARGIN = 512 * 2**20
 
 
-def pass_cache_allowance(budget, peak_reserved, free, reserve, commit_available=None, windows=None):
+def pass_cache_allowance(budget, peak_reserved, free, reserve, commit_available=None, windows=None,
+                         device_free=None):
     """Spare capacity after one real step, bounded independently by live space.
 
     Keep another 512 MiB beyond the existing OS reserve for pass-local growth,
     and on Windows another WINDOWS_PASS_CACHE_MARGIN below the local budget.
     Windows GPU allocations can also consume commit; retain host workspace.
+    `device_free` is what the whole device can still take with every other
+    process counted (Windows' budget and CUDA's free memory leave them out).
     """
     if windows is None:
         import os
@@ -178,12 +380,28 @@ def pass_cache_allowance(budget, peak_reserved, free, reserve, commit_available=
     if windows:
         budget -= WINDOWS_PASS_CACHE_MARGIN
     bounds = [budget - peak_reserved, free - reserve]
+    if device_free is not None:
+        bounds.append(device_free - reserve)
     if commit_available is not None:
         # Sampling workspace has already been exercised. This cache creates no
         # new host tensors, so do not reserve the full model-loading allowance
         # again. Still leave 2 GiB of system commit before optional GPU growth.
         bounds.append(commit_available - 2 * 2**30)
     return max(0, int(min(bounds)) - 512 * 2**20)
+
+
+def reusable_cache_bytes(cached, reserved, workspace_peak):
+    """Device bytes a pass cache holds or can take back without a new allocation.
+
+    Planes dropped from the cache stay in the allocator's pool, where
+    mem_get_info no longer counts them as free. Counting only the planes still
+    cached shrank the cache again at every step: an 8 GiB Windows card filled
+    eight first-pass planes after its first step and ended the pass with one.
+    What the allocator holds beyond the step's own peak is the cache's to reuse.
+    """
+    if reserved is None:
+        return cached
+    return max(cached, reserved - workspace_peak)
 
 
 def first_pass_policy(profile, canvas, sampling_plan):
@@ -227,3 +445,56 @@ def first_pass_policy(profile, canvas, sampling_plan):
     selected['engine']['steps'] = sampling_plan['base_steps']
     selected['policy']['engine']['steps'] = sampling_plan['base_steps']
     return dict(geometry=first, profile=selected)
+
+
+# Placement options a recovery attempt may have loosened or tightened. A first
+# pass that is kept across a retry never uses more GPU residency, parallel
+# workspaces or pinned host memory than the retry itself allows; its compute
+# partitions (chunk sizes) are not in this list and stay as planned.
+RETRY_MIN_KEYS = ('resident_blocks', 'head_parallelism', 'pin_host_gb')
+RETRY_AND_KEYS = ('prefetch', 'pin_host_weights', 'preload_host')
+RETRY_OR_KEYS = ('residual_offload', 'fp8_ff_recompute', 'stream_weights')
+
+
+def clamp_first_pass_for_retry(first_policy, retry_profile):
+    """The first-pass policy limited to the placement a resource retry selected.
+
+    Returns (policy, clamped) where `clamped` maps each option the retry
+    tightened to its first-pass and retry values. The input is not modified.
+    """
+    import copy
+    policy = copy.deepcopy(first_policy)
+    engine, retry = policy['profile']['engine'], retry_profile['engine']
+    clamped = {}
+    def set_option(name, value):
+        if engine.get(name) != value:
+            clamped[name] = {'first_pass': engine.get(name), 'retry': retry.get(name)}
+            engine[name] = value
+    for name in RETRY_MIN_KEYS:
+        if name in retry and name in engine:
+            set_option(name, min(engine[name], retry[name]))
+    for name in RETRY_AND_KEYS:
+        if name in retry and name in engine:
+            set_option(name, bool(engine[name] and retry[name]) if isinstance(engine[name], bool) else engine[name])
+    for name in RETRY_OR_KEYS:
+        if retry.get(name) and not engine.get(name):
+            set_option(name, retry[name])
+    inner = policy['profile'].get('policy')
+    if isinstance(inner, dict) and isinstance(inner.get('engine'), dict):
+        inner['engine'].update({name: engine[name] for name in clamped})
+    return policy, clamped
+
+
+def keeps_first_pass_on_retry(attempts, max_retries):
+    """Whether the retry now starting may keep the first pass's planned placement.
+
+    Only the first recovery attempt does, and only while every recovery so far
+    kept the arithmetic partitions. The last attempt falls back to the
+    conservative profile exactly as before, so a first pass whose own chunk
+    sizes were the cause cannot fail the request twice.
+    """
+    rows = list(attempts or [])
+    if len(rows) != 2 or len(rows) - 1 >= max_retries:
+        return False
+    decision = rows[-1].get('decision') or {}
+    return decision.get('numerical_class') != 'compute-partition'

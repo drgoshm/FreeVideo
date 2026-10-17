@@ -46,6 +46,11 @@ def ms_parallel(module, url, target, file_size, headers, cookies, progress_callb
     offset = merged.stat().st_size if merged.exists() else 0
     if offset > file_size:
         raise ValueError('Retained merge exceeds the pinned model size')
+    def verifying(done, total):
+        for callback in callbacks:
+            report = getattr(callback, 'verify_progress', None)
+            if report:
+                report(done, total)
     if offset % module.DOWNLOAD_PART_SIZE:
         # A switched HTTP download may end in the middle of an SDK part.
         # Seed that part so its first Range starts after the retained prefix.
@@ -59,11 +64,14 @@ def ms_parallel(module, url, target, file_size, headers, cookies, progress_callb
         with merged.open('rb') as prefix, part.open('a+b') as output:
             prefix.seek(start); output.seek(0)
             remaining=min(existing,offset-start)
+            total = remaining
+            verifying(0, total)
             while remaining:
                 count=min(BLOCK,remaining)
                 if prefix.read(count)!=output.read(count):
                     raise ValueError('Retained part differs from switched prefix')
                 remaining-=count
+                verifying(total-remaining, total)
             if existing<offset-start:
                 prefix.seek(start+existing); output.seek(0,2)
                 remaining=offset-start-existing
@@ -83,11 +91,13 @@ def ms_parallel(module, url, target, file_size, headers, cookies, progress_callb
                 raise ValueError('Unexpected size of a retained merged part')
             with merged.open('rb') as prefix, part.open('rb') as stream:
                 prefix.seek(start)
+                verifying(0, end-start)
                 for block in iter(lambda: stream.read(BLOCK), b''):
                     if block != prefix.read(len(block)):
                         raise ValueError('Retained part differs from merged prefix')
                     discard_read_cache(prefix.fileno(), prefix.tell()-len(block), len(block))
                     discard_read_cache(stream.fileno(), stream.tell()-len(block), len(block))
+                    verifying(stream.tell(), end-start)
             part.unlink()
     tasks = [(str(target), callbacks, start, min(file_size, start+module.DOWNLOAD_PART_SIZE)-1,
               url, target.name, headers, cookies)
@@ -97,12 +107,21 @@ def ms_parallel(module, url, target, file_size, headers, cookies, progress_callb
         list(pool.map(module._download_part_with_retry, tasks))
     for callback in callbacks:
         callback.end()
+    def merging(done):
+        for callback in callbacks:
+            report = getattr(callback, 'merge_progress', None)
+            if report:
+                report(done, file_size)
+    merging(0)
     digest = hashlib.sha256()
     if offset:
+        read = 0
         with merged.open('rb') as prefix:
             for block in iter(lambda: prefix.read(BLOCK), b''):
                 digest.update(block)
                 discard_read_cache(prefix.fileno(), prefix.tell()-len(block), len(block))
+                read += len(block)
+                merging(read)
     with merged.open('ab') as output:
         for task in tasks:
             start, end = task[2:4]
@@ -115,6 +134,7 @@ def ms_parallel(module, url, target, file_size, headers, cookies, progress_callb
                     output.write(block)
                     digest.update(block)
                     discard_read_cache(stream.fileno(), stream.tell()-len(block), len(block))
+                    merging(output.tell())
             output.flush()
             os.fsync(output.fileno())
             offset = end+1
@@ -124,6 +144,7 @@ def ms_parallel(module, url, target, file_size, headers, cookies, progress_callb
     if merged.stat().st_size != file_size:
         raise ValueError('Merged model has an unexpected size')
     publish(merged, target)
+    merging(file_size)
     return digest.hexdigest()
 
 

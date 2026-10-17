@@ -52,6 +52,9 @@ def spare_compute_trials(row, engine, peak_bytes, headroom_bytes):
                             workspace_per_lane_bytes=int(workspace),
                             reason='Overlap unchanged head groups; extra live workspace uses measured spare VRAM')))
     canvas = row.get('geometry', {})
+    if canvas.get('early_reference') is not None:
+        # Measured spare memory has no stage identity in this proposal schema.
+        return result
     rows = canvas.get('video_tokens')
     if type(rows) is not int or rows <= 0:
         return result

@@ -94,7 +94,10 @@ def prepare(source, directory):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(data)
         (stage / 'identity.json').write_text(json.dumps(identity, indent=2) + '\n')
-        shutil.copyfile(source / 'LICENSE', stage / 'LICENSE')
+        try:
+            shutil.copyfile(source / 'LICENSE', stage / 'LICENSE')
+        except OSError:
+            pass   # the licence text is carried when the source has one
         try:
             stage.rename(target)
         except OSError:

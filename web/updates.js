@@ -1,9 +1,9 @@
 import { api } from '../../scripts/api.js';
 
-// Every platform downloads from one release: the latest vX.Y.Z, or the rolling nightly.
+// Every platform downloads from one release: the latest vX.Y.Z.
 const releasePage = 'https://github.com/FlashML-org/FreeVideo/releases/latest';
-const nightlyPage = 'https://github.com/FlashML-org/FreeVideo/releases/tag/nightly';
 const storageKey = 'freevideo.dismissed-update';
+const CANCEL_FAILURE = {en: 'Cancellation failed. Please use the launcher.', zh: '取消没成功，请在启动器里操作'};
 const listeners = new Set();
 // Launcher phases during which the server may disappear and come back updated.
 const working = new Set(['checking', 'downloading', 'waiting', 'restarting', 'engine']);
@@ -81,10 +81,17 @@ export async function applyUpdate() {
 }
 
 export async function cancelUpdate() {
-    try {
-        const response = await api.fetchApi('/freevideo/updates/cancel', {method: 'POST', cache: 'no-store', signal: AbortSignal.timeout(10000)});
-        if (response.ok) updating = false;
-    } catch { /* The launcher keeps its state; the next poll shows it. */ }
+    failure = '';
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const response = await api.fetchApi('/freevideo/updates/cancel', {method: 'POST', cache: 'no-store', signal: AbortSignal.timeout(10000)});
+            if (!response.ok) throw new Error(response.statusText);
+            updating = false;
+            break;
+        } catch {
+            if (attempt === 1) failure = 'cancel';
+        }
+    }
     publish();
     lastCheck = -Infinity;
     later(800);
@@ -134,22 +141,25 @@ export function createUpdateNotice(cn) {
     element.append(label, details, apply, link, dismiss, stop, summary);
     const render = () => {
         const launcher = value?.launcher, phase = launcher?.phase || '', candidate = value?.available;
-        const mac = value?.channel === 'macos-preview';
-        link.href = value?.track === 'nightly' ? nightlyPage : releasePage;
+        const mac = value?.channel === 'macos-preview', linux = value?.channel === 'linux-preview';
+        link.href = releasePage;
         link.title = mac
             ? t('After your task finishes, open the new FreeVideo.app to update.', '当前任务完成后，打开新版 FreeVideo.app 更新。')
+            : linux ? t('After your task finishes, open the new FreeVideo AppImage to update.', '当前任务完成后，打开新版 FreeVideo AppImage 更新。')
             : t('After your task finishes, open the new FreeVideo.exe to update.', '当前任务完成后，打开新版 FreeVideo.exe 更新。');
         const progress = launcher?.progress, percent = progress?.total ? ' ' + Math.floor(100 * progress.done / progress.total) + '%' : '';
         // The last model state seen stays while ComfyUI is away.
         const model = launcher?.model || '';
         const busy = updating && (working.has(phase) || !!model || offline);
         let text = '', actions = false;
-        if (busy) {
+        if (failure === 'cancel') {
+            text = t(CANCEL_FAILURE.en, CANCEL_FAILURE.zh);
+        } else if (busy) {
             text = model === 'switching' || (model && offline)
-                ? t('Switching to the faster model… ComfyUI restarts once and this page reconnects by itself.', '正在切换到更快的模型…ComfyUI 会重启一次，页面会自动恢复。')
-                : model === 'waiting' ? t('The faster model is ready. FreeVideo switches after the current video; ComfyUI restarts once.', '更快的模型已下载好，当前视频生成完后自动切换，ComfyUI 会重启一次。')
+                ? t('Switching to the faster model. This page reconnects by itself.', '正在切换到更快的模型，页面会自动恢复。')
+                : model === 'waiting' ? t('The faster model is ready. FreeVideo switches after the current video.', '更快的模型已下载好，当前视频完成后自动切换。')
                 : offline || phase === 'restarting' || phase === 'engine'
-                ? t('Restarting FreeVideo to finish the update… this page refreshes by itself.', '正在重启 FreeVideo 完成更新…页面会自动刷新。')
+                ? t('Restarting FreeVideo to finish the update. The page refreshes by itself.', '正在重启 FreeVideo 完成更新，页面会自动刷新。')
                 : phase === 'downloading' ? t('Downloading the update', '正在下载更新') + percent
                 : phase === 'waiting' ? t('The update installs as soon as the current video finishes.', '当前视频生成完成后会自动更新。')
                 : t('Checking for updates…', '正在检查更新…');
@@ -158,7 +168,7 @@ export function createUpdateNotice(cn) {
         } else if (failure) {
             text = t('Open the FreeVideo launcher to update, or download the new version.', '请在 FreeVideo 启动器中更新，或下载新版。');
             actions = true;
-        } else if (candidate && dismissed !== identity(candidate)) {
+        } else if (candidate) {
             text = t('FreeVideo update available', 'FreeVideo 有新版本') + ' · ' + displayVersion(candidate);
             if (launcher?.status === 'error' && launcher.error) text += ' · ' + t('last attempt failed', '上次更新未完成');
             actions = true;
@@ -174,7 +184,7 @@ export function createUpdateNotice(cn) {
         const direct = !!launcher && !launcher.manual && !failure;
         apply.hidden = !actions || !direct;
         link.hidden = !actions || direct;
-        dismiss.hidden = !actions;
+        dismiss.hidden = !actions || dismissed === identity(candidate);
         stop.hidden = !(busy && phase === 'waiting' && !offline);
     };
     listeners.add(render); render();

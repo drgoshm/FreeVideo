@@ -15,11 +15,15 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+from types import SimpleNamespace
+from . import execution_paths
+from . import subprocess_output
 from .windows_ux import external_python, hidden_console
 import threading
 import time
 from urllib.parse import quote, unquote, urlencode, urljoin, urlsplit
 from . import proxy
+from .long_paths import io_path, plain_errors
 from .system import curl_executable, missing_curl_message, windows
 
 
@@ -30,7 +34,9 @@ SOURCES = {
     'vdn-models': {'official': 'https://huggingface.co', 'hf-mirror': 'https://hf-mirror.com',
                    'modelscope': 'https://www.modelscope.cn'},
     'edge-models': {'official': 'https://huggingface.co', 'hf-mirror': 'https://hf-mirror.com',
-                    'modelscope': 'https://modelscope.ai'},
+                    'modelscope': 'https://www.modelscope.cn'},
+    'image-models': {'official': 'https://huggingface.co', 'hf-mirror': 'https://hf-mirror.com',
+                     'modelscope': 'https://www.modelscope.cn'},
     'github': {'official': 'https://github.com', 'ghfast': 'https://ghfast.top/https://github.com'},
     'cuda': {'official': 'https://developer.download.nvidia.com/compute/cuda/redist',
              'nvidia-cn': 'https://developer.download.nvidia.cn/compute/cuda/redist'},
@@ -40,6 +46,19 @@ SAMPLE_BYTES = 256 * 1024
 SPEED_SAMPLE_BYTES = 32 * 2**20
 SPEED_SAMPLE_SECONDS = 3.
 MIN_TRANSFER_LIMIT = 1024 * 1024
+# A transfer that is moving but slowly is compared with the untried sources: after
+# SWITCH_AFTER_SECONDS the others get one bounded speed sample and the transfer
+# moves (resuming the same partial) when that saves a real amount of time.
+SWITCH_AFTER_SECONDS = 15.
+SWITCH_RECHECK_SECONDS = 180.
+SWITCH_MAX_CHECKS = 3
+SWITCH_MIN_REMAINING_SECONDS = 90.
+SWITCH_MIN_SAVING_SECONDS = 60.
+SWITCH_MIN_GAIN = 2.
+# One quick pass over sources/routes, followed by at most one patient pass.
+# These are inactivity timeouts, not deadlines for an entire installation.
+DOWNLOAD_RETRY_PROFILES = (('fast', '20', '1'), ('patient', '120', '5'))
+PATIENT_DOWNLOAD_NOTICE = 'The network is slow. Downloading again; this may take a while.'
 
 
 def proxy_environment(environ=None):
@@ -64,9 +83,10 @@ def source_url(family, name, env=None):
     return SOURCES[family][name]
 
 
+@plain_errors
 def model_spec(spec=None):
     return (spec if spec is not None else
-            json.loads(Path(__file__).with_name('dependencies.json').read_text(encoding='utf-8')))['models']
+            json.loads(io_path(Path(__file__).with_name('dependencies.json')).read_text(encoding='utf-8')))['models']
 
 
 def modelscope_mapping(row, spec=None):
@@ -88,11 +108,15 @@ def modelscope_mapping(row, spec=None):
 
 
 def model_family(row, spec=None):
+    if row.get('family') == 'image':
+        return 'image-models'
     mirror = modelscope_mapping(row, spec)
     return mirror['family'] if mirror else 'models'
 
 
 def model_url(row, name, env=None, *, spec=None):
+    if row.get('family') == 'image':
+        return next(s['url'] for s in row['sources'] if s['id'] == name)
     if name == 'modelscope':
         mirror = modelscope_mapping(row, spec)
         if not mirror:
@@ -106,9 +130,13 @@ def model_url(row, name, env=None, *, spec=None):
 def model_urls(network, row, env=None, *, spec=None):
     family = model_family(row, spec)
     # Plans made before ModelScope support keep their existing HF ordering.
-    if family not in network.get('sources', {}):
+    if family != 'image-models' and family not in network.get('sources', {}):
         family = 'models'
     names = ['official'] if network.get('mode') == 'official' or row.get('official_only') else ordered(network, family)
+    if family == 'image-models' and network.get('mode') != 'official' and not row.get('official_only'):
+        available = {s['id'] for s in row['sources']}
+        names = [n for n in names if n in available]
+        names += [s['id'] for s in row['sources'] if s['id'] not in names]
     return [(name, model_url(row, name, env, spec=spec)) for name in names]
 
 
@@ -137,7 +165,7 @@ def curl_process(command, **kwargs):
     # otherwise healthy external curl binaries (including Git's copy).
     try:
         with external_python():
-            return subprocess.Popen(command, **kwargs, **hidden_console())
+            return execution_paths.popen(command, **kwargs, **hidden_console())
     except OSError as error:
         if not windows():
             raise
@@ -274,6 +302,9 @@ def probe(family, name, spec, versions, timeout, env, *, measure_speed=False):
             settings = spec['models']
             url = model_url({'repo': settings['encoder_repo'], 'revision': settings['encoder_revision'],
                              'file': settings['encoder_file']}, name, env, spec=spec)
+        elif family == 'image-models':
+            from .image_gen.image_pack import rows
+            url = model_url(rows()[0], name, env)
         elif family in ('vdn-models', 'edge-models'):
             settings = spec['models']
             mirror = settings[family.split('-')[0] + '_modelscope']
@@ -293,10 +324,10 @@ def probe(family, name, spec, versions, timeout, env, *, measure_speed=False):
             # select its existing SSH URL instead of the HTTPS URL being tested.
             # A private temporary name avoids that; carry origin's proxy policy
             # so the probe still matches the subsequent dependency fetch.
-            origin_proxy = subprocess.run(['git', 'config', '--get', 'remote.origin.proxy'], env=env,
+            origin_proxy = execution_paths.run(['git', 'config', '--get', 'remote.origin.proxy'], env=env,
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=3, **hidden_console())
             if origin_proxy.returncode == 0:
-                settings['remote.' + remote + '.proxy'] = origin_proxy.stdout.decode().rstrip('\r\n')
+                settings['remote.' + remote + '.proxy'] = subprocess_output.decode_output(origin_proxy.stdout).rstrip('\r\n')
             elif origin_proxy.returncode != 1:
                 raise RuntimeError('Git proxy configuration could not be read')
             git_env = proxy.git_environment(env, settings)
@@ -312,7 +343,7 @@ def probe(family, name, spec, versions, timeout, env, *, measure_speed=False):
             component = versions['cuda_toolkits']['13.0']['components']['cuda_cudart']
             url = base + '/' + component['relative_path']
         headers = ()
-        if (family in ('models', 'vdn-models', 'edge-models') and name == 'official'
+        if (family in ('models', 'vdn-models', 'edge-models', 'image-models') and name == 'official'
                 and urlsplit(url).scheme == 'https' and urlsplit(url).netloc == 'huggingface.co'):
             token = env.get('HF_TOKEN') or env.get('HUGGING_FACE_HUB_TOKEN')
             if token:
@@ -368,7 +399,7 @@ def plan(spec, versions, layout='unified', *, mode='auto', timeout=5, offline=Fa
         raise ValueError('Unknown download connection mode')
     proxy_configured = proxy.configured(env)
     git_keys = [] if offline or model_only else proxy.git_proxy_keys(env)
-    families = ['pypi', 'models', 'vdn-models', 'github', 'git', 'cuda']
+    families = ['pypi', 'models', 'vdn-models', 'image-models', 'github', 'git', 'cuda']
     if spec['models'].get('edge_modelscope'):
         families.insert(3, 'edge-models')
     if versions.get('target_system') in ('Windows', 'Darwin'):
@@ -379,7 +410,7 @@ def plan(spec, versions, layout='unified', *, mode='auto', timeout=5, offline=Fa
         if family not in families:
             families.append(family)
     if model_only:
-        families=[family for family in families if family in ('models','vdn-models','edge-models')]
+        families=[family for family in families if family in ('models','vdn-models','edge-models','image-models')]
     selections, jobs = {}, []
     for family in families:
         group = 'torch' if family.startswith('torch-') else 'github' if family == 'git' else family
@@ -561,57 +592,136 @@ def _package_attempt(error, source, route):
                 returncode=getattr(error, 'returncode', None), detail=detail, summary=summary)
 
 
-def package_environment(network, family, name, environ=None, *, route=None):
+def download_environment(environ, retry_mode='fast'):
+    """Apply shared uv/pip defaults without replacing any user setting."""
+    _, timeout, retries = next(row for row in DOWNLOAD_RETRY_PROFILES if row[0] == retry_mode)
+    env = dict(environ)
+    for key, value in (('UV_HTTP_TIMEOUT', timeout), ('UV_HTTP_RETRIES', retries),
+                       ('PIP_DEFAULT_TIMEOUT', timeout), ('PIP_RETRIES', retries)):
+        env.setdefault(key, value)
+    return env
+
+
+# Only a validation failure counts: a package or service that merely has
+# "checksum" in its name must stay eligible for the slow-network retry. Keep in
+# sync with fv_slow_download_failure in scripts/bootstrap_linux.sh.
+_INTEGRITY_FAILURE = re.compile(
+    r"\b(?:invalid|bad|wrong|incorrect|mismatched?)\s+checksums?\b"
+    r"|\bchecksums?\s+(?:mismatch|error|failed|failure)\b"
+    r"|\bchecksums?\s+(?:verification|validation)\s+(?:failed|failure|error)\b"
+    r"|\bchecksums?\s+(?:does\s+not|doesn't|did\s+not|didn't|do\s+not|don't)\s+match\b"
+    r"|\b(?:does\s+not|doesn't|did\s+not|didn't|do\s+not|don't)\s+match\s+(?:the\s+|its\s+|expected\s+)?(?:checksums?|hash(?:es)?)\b"
+    r"|\bhash\s+(?:mismatch|check\s+failed|does\s+not\s+match)\b|\bhashes\s+(?:do\s+not|didn't)\s+match\b"
+    r"|\bsha-?256\s+mismatch\b|\bdigest\s+mismatch\b"
+    r"|\bintegrity\s+(?:check|verification)\s+failed\b")
+
+
+def _download_integrity_failure(detail):
+    # URL paths may contain validation words without a validation failure.
+    detail = re.sub(r'https?://\S+', '', detail.lower())
+    return bool(_INTEGRITY_FAILURE.search(detail))
+
+
+def slow_download_failure(detail):
+    """Mirror fallback is broader than permission to retry a whole slow pass."""
+    return (connection_failure(detail) and not _download_integrity_failure(detail)
+            and not re.search(r'\b(?:401|403|404|410)\b', detail)
+            and not any(word in detail.lower() for word in
+                        ('certificate verify failed', 'certificate_verify_failed',
+                         'invalid peer certificate', 'unknown issuer', 'not found',
+                         'resolutionimpossible', 'failed to build', 'invalid wheel',
+                         'permission denied', 'no space left on device', 'disk full')))
+
+
+def package_environment(network, family, name, environ=None, *, route=None, retry_mode='fast'):
     env = route_environment(network, family, name, environ, route)
+    env = download_environment(env, retry_mode)
     endpoint = source_url(family, name, environ)
     if family.startswith('torch-'):
         endpoint += '/' + family.split('-')[1]
-    env.update(UV_DEFAULT_INDEX=endpoint, UV_INDEX_URL=endpoint, PIP_INDEX_URL=endpoint,
-               UV_HTTP_TIMEOUT='20', UV_HTTP_RETRIES='1', PIP_DEFAULT_TIMEOUT='20', PIP_RETRIES='1',
-               UV_NO_CONFIG='1')
+    env.update(UV_DEFAULT_INDEX=endpoint, UV_INDEX_URL=endpoint, PIP_INDEX_URL=endpoint, UV_NO_CONFIG='1')
     for key in ('UV_INDEX', 'UV_EXTRA_INDEX_URL', 'PIP_EXTRA_INDEX_URL'):
         env.pop(key, None)
     return env
 
 
-def package_command(network, family, run, env=None):
+def download_command(network, family, run, env=None, *, category=None, extra_sources=(), notice=None):
+    """Run a source/route callback with the same bounded policy for uv and pip.
+
+    Callbacks receive (source, route, retry_mode); each builds its child env from
+    the original environment, so our fast defaults never become user overrides.
+    """
+    category = category or family
+    operation = 'python' if category == 'python' else 'package'
     attempts = []
-    for name in ordered(network, family):
-        for route in route_order(network, family, name, env):
-            event(network, category=family, source=name, route=route, action='package-attempt')
-            try:
-                attempt_env = package_environment(network, family, name, env, route=route)
-                # The host setup uses these private markers to retain one log
-                # per source/route instead of overwriting the first failure.
-                # They are never included in a report or sent to a package
-                # manager as configuration.
-                attempt_env['FREEVIDEO_PACKAGE_SOURCE'] = name
-                attempt_env['FREEVIDEO_PACKAGE_ROUTE'] = route
-                result = run(attempt_env, name)
-                source_health(network, family, name, True)
-                route_health(network, family, name, route)
-                return result
-            except (RuntimeError, subprocess.CalledProcessError) as error:
-                attempt = _package_attempt(error, name, route)
-                attempts.append(attempt)
-                event(network, category=family, source=name, route=route, action='package-failed',
-                      error_type=attempt['error_type'], returncode=attempt['returncode'],
-                      detail=attempt['detail'], summary=attempt['summary'])
-                detail = attempt['detail']
-                if not retryable(detail):
-                    # Preserve the original exception type and traceback for
-                    # build/configuration errors, but make the attempt data
-                    # available to the local report collector.
-                    try:
-                        error.package_attempts = attempts
-                    except Exception:
-                        pass
-                    raise
-                event(network, category=family, source=name, route=route, action='package-fallback', reason='network-or-unavailable-pinned-package')
-                if not connection_failure(detail):
-                    break
-        source_health(network, family, name, False)
-    raise PackageSourcesError(family, attempts)
+    for retry_mode, timeout, retries in DOWNLOAD_RETRY_PROFILES:
+        if retry_mode == 'patient':
+            if not attempts or not all(slow_download_failure(row['detail']) for row in attempts):
+                break
+            event(network, category=category, action='download-round-result', retry_mode='fast',
+                  result='failed', attempts=len(attempts))
+            event(network, category=category, action='download-patient-retry', retry_mode=retry_mode,
+                  default_timeout_seconds=int(timeout), default_retries=int(retries))
+            if notice is None:
+                print(PATIENT_DOWNLOAD_NOTICE, flush=True)
+            else:
+                notice(PATIENT_DOWNLOAD_NOTICE)
+        round_start = len(attempts)
+        retry_details = {'retry_mode': retry_mode} if retry_mode == 'patient' else {}
+        if retry_mode == 'patient':
+            event(network, category=category, action='download-round-start', retry_mode=retry_mode)
+        # Re-read health and allowed routes after the fast pass. Equal failures
+        # retain the existing probe order; no new connectivity probes are made.
+        for name in [*extra_sources, *ordered(network, family)]:
+            for route in route_order(network, family, name, env):
+                if operation == 'package' or retry_mode == 'patient':
+                    event(network, category=category, source=name, route=route,
+                          action=operation + '-attempt', **retry_details)
+                try:
+                    result = run(name, route, retry_mode)
+                    source_health(network, family, name, True)
+                    route_health(network, family, name, route)
+                    if retry_mode == 'patient':
+                        event(network, category=category, action='download-round-result', retry_mode=retry_mode,
+                              result='success', attempts=len(attempts)-round_start+1)
+                    return result
+                except (RuntimeError, subprocess.CalledProcessError) as error:
+                    attempt = dict(_package_attempt(error, name, route), retry_mode=retry_mode)
+                    attempts.append(attempt)
+                    event(network, category=category, source=name, route=route, action=operation + '-failed',
+                          error_type=attempt['error_type'], returncode=attempt['returncode'],
+                          detail=attempt['detail'], summary=attempt['summary'], **retry_details)
+                    detail = attempt['detail']
+                    if (not retryable(detail)
+                            or (retry_mode == 'patient' and not slow_download_failure(detail))):
+                        if retry_mode == 'patient':
+                            event(network, category=category, action='download-round-result', retry_mode=retry_mode,
+                                  result='failed', attempts=len(attempts)-round_start, reason='non-network-error')
+                        # Retain original build/configuration/integrity errors.
+                        try:
+                            error.package_attempts = attempts
+                        except Exception:
+                            pass
+                        raise
+                    event(network, category=category, source=name, route=route, action=operation + '-fallback',
+                          reason='network-or-unavailable-pinned-package', **retry_details)
+                    if not connection_failure(detail):
+                        break
+            source_health(network, family, name, False)
+        if retry_mode == 'patient':
+            event(network, category=category, action='download-round-result', retry_mode=retry_mode,
+                  result='failed', attempts=len(attempts)-round_start)
+    raise PackageSourcesError(category, attempts)
+
+
+def package_command(network, family, run, env=None, *, notice=None):
+    def attempt(name, route, retry_mode):
+        attempt_env = package_environment(network, family, name, env, route=route, retry_mode=retry_mode)
+        # Private markers retain per-source/route logs; no package configuration.
+        attempt_env['FREEVIDEO_PACKAGE_SOURCE'] = name
+        attempt_env['FREEVIDEO_PACKAGE_ROUTE'] = route
+        return run(attempt_env, name)
+    return download_command(network, family, attempt, env, notice=notice)
 
 
 def hash_file(path, algorithm='sha256', git_blob=False, *, discard_cache=False, progress=None):
@@ -671,13 +781,58 @@ class DownloadError(RuntimeError):
     """Every permitted source failed; an alternate artifact may be tried."""
 
 
+def _faster_source(compare, now, started, offset, done, size, alternatives, timeout, env, network, category, headers_for,
+                   full_restart=False):
+    """Return the untried candidate worth moving to, or None. Never blocks the transfer loop."""
+    thread = compare['thread']
+    if thread is None:
+        if now < compare['at']:
+            return None
+        rate = (done - offset) / max(.001, now - started)
+        remaining = size - done
+        if rate <= 0 or remaining / rate < SWITCH_MIN_REMAINING_SECONDS:
+            compare['at'] = now + SWITCH_RECHECK_SECONDS
+            return None
+        compare['current'], compare['remaining'], compare['rates'] = rate, remaining, {}
+        compare['checks'] += 1
+        names = {}
+        for row in alternatives:
+            names.setdefault(row[0], row)
+
+        def measure(row):
+            name, url, route = row
+            try:
+                headers = headers_for(name) if headers_for else ()
+                _, result = speed_sample(url, timeout, env=route_environment(network, category, name, env, route),
+                                         headers=headers)
+                value = result.get('bytes_per_second') if result.get('speed_measured') else None
+            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError):
+                value = None
+            if value:
+                compare['rates'][row[0], row[2]] = value
+        compare['thread'] = threading.Thread(target=lambda: [measure(r) for r in list(names.values())[:3]], daemon=True)
+        compare['thread'].start()
+        return None
+    if thread.is_alive():
+        return None
+    compare['thread'] = None
+    compare['at'] = now + SWITCH_RECHECK_SECONDS
+    best = max(compare['rates'].items(), key=lambda item: item[1], default=None)
+    if best is None:
+        return None
+    rate, remaining = compare['current'], compare['remaining']
+    if best[1] >= SWITCH_MIN_GAIN * rate and remaining / rate - (size if full_restart else remaining) / best[1] >= SWITCH_MIN_SAVING_SECONDS:
+        return next((row for row in alternatives if (row[0], row[2]) == best[0]), None)
+    return None
+
+
 def download(candidates, path, expected, progress=None, *, network=None, env=None, size=None,
              algorithm='sha256', git_blob=False, headers_for=None, stall_seconds=None, category='download',
              low_speed_limit=1024, max_seconds=None, cycles=2, slow_seconds=None, keep_partial=False):
     """Resume across ranked sources; hash before accepting, retain rejected bytes."""
     network = network or {}
     path = Path(path)
-    model = category in ('models', 'vdn-models', 'edge-models')
+    model = category in ('models', 'vdn-models', 'edge-models', 'image-models')
     stall_seconds = stall_seconds if stall_seconds is not None else 120 if model else 20
 
     def matches(candidate, source='local'):
@@ -685,8 +840,16 @@ def download(candidates, path, expected, progress=None, *, network=None, env=Non
             return False
         event(network, category=category, source=source, file=path.name, action='verifying', algorithm=algorithm)
         check = network.get('resource_check') if keep_partial else None
-        return hash_file(candidate, algorithm, git_blob, discard_cache=category in ('models', 'vdn-models'),
-                         progress=(lambda done, total: check()) if check else None) == expected
+        from .install_activity import byte_progress
+        report = byte_progress('verify_progress', path.name, report=lambda **row:
+            event(network, category=category, source=source, action='verify-progress', **row))
+        def verification(done, total):
+            if check:
+                check()
+            if model:
+                report(done, total)
+        return hash_file(candidate, algorithm, git_blob, discard_cache=category in ('models', 'vdn-models', 'image-models'),
+                         progress=verification if model or check else None) == expected
     if path.is_file():
         if matches(path):
             return
@@ -720,7 +883,7 @@ def download(candidates, path, expected, progress=None, *, network=None, env=Non
     for cycle in range(cycles):
         # Once every route has been tried, keep the fastest observed route even
         # if the user's entire connection is slow. Do not oscillate forever.
-        if cycle and slow_seconds is not None:
+        if cycle and measured_rates:
             candidates.sort(key=lambda row: -measured_rates.get((row[0], row[2]), 0))
         for candidate_index, (name, url, route) in enumerate(candidates):
             for restart in range(3 if model else 2):
@@ -764,11 +927,14 @@ def download(candidates, path, expected, progress=None, *, network=None, env=Non
                 if offset:
                     command += ['--continue-at', str(offset)]
                 process = curl_process(command, env=attempt_env, stdin=subprocess.PIPE,
-                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 started = time.monotonic()
                 oversized = None
                 stalled = False
                 slow = False
+                faster = None
+                compare = dict(thread=None, rates={}, checks=0, at=started + SWITCH_AFTER_SECONDS, current=0.)
+                alternatives_ahead = [row for row in candidates[candidate_index+1:] if row[0] != name]
                 last_body, previous_done = started, offset
                 recent = deque([(started, offset)])
                 try:
@@ -800,6 +966,12 @@ def download(candidates, path, expected, progress=None, *, network=None, env=Non
                                 and (done - recent[0][1]) / (now - recent[0][0]) < low_speed_limit):
                             slow = True
                             break
+                        if (cycle == 0 and size and alternatives_ahead and compare['checks'] < SWITCH_MAX_CHECKS
+                                and not network.get('manual_source_switch')):
+                            faster = _faster_source(compare, now, started, offset, done, size, alternatives_ahead,
+                                                    timeout, env, network, category, headers_for)
+                            if faster is not None:
+                                break
                         if progress:
                             sample = next((row for row in recent if row[0] >= now - 5), recent[0])
                             progress(done, size or 0, max(0, done - sample[1]) / max(.001, now - sample[0]))
@@ -808,6 +980,9 @@ def download(candidates, path, expected, progress=None, *, network=None, env=Non
                         except subprocess.TimeoutExpired:
                             pass
                 finally:
+                    thread = compare['thread']
+                    if thread is not None and thread.is_alive():
+                        thread.join(timeout=timeout + SPEED_SAMPLE_SECONDS + 3)
                     if process.poll() is None:
                         process.terminate()
                         try:
@@ -817,10 +992,19 @@ def download(candidates, path, expected, progress=None, *, network=None, env=Non
                             process.wait()
                     status = process.stdout.read(16).decode(errors='replace')
                     process.stdout.close()
+                    # --silent --show-error keeps this to a line or two.
+                    curl_message = _package_failure(SimpleNamespace(stderr=process.stderr.read(2048)))[1] if process.returncode else ''
+                    process.stderr.close()
                 current_size = partial.stat().st_size if partial.exists() else 0
                 if slow_seconds is not None:
                     measured_rates[name, route] = (max(0, current_size - offset) /
                         max(.001, time.monotonic() - started)) if slow else 0
+                if faster is not None:
+                    measured_rates[name, route] = compare['current']
+                    measured_rates.update(compare['rates'])
+                    # The faster source is tried next, with the retained prefix.
+                    position = candidates.index(faster)
+                    candidates.insert(candidate_index + 1, candidates.pop(position))
                 if model and current_size > offset:
                     remember_source()
                 if oversized is not None:
@@ -850,19 +1034,24 @@ def download(candidates, path, expected, progress=None, *, network=None, env=Non
                     # A mirror lacking Range must start over, with previous bytes kept.
                     retain_partial(partial, 'resume-unavailable')
                     continue
-                transient = stalled or process.returncode in (5, 6, 7, 18, 28, 35, 52, 55, 56, 92, 95) or status in ('429', '500', '502', '503', '504')
+                # A connection that was moving bytes and then ended with an
+                # unclassified exit is an interruption, not a refusal.
+                interrupted = process.returncode not in (0, 22, 33, 63) and current_size > offset
+                transient = (stalled or interrupted or process.returncode in (5, 6, 7, 18, 28, 35, 52, 55, 56, 92, 95)
+                             or status in ('429', '500', '502', '503', '504'))
                 if model and transient and restart < 2 and candidate_index + 1 == len(candidates) and process.returncode not in (5, 7):
                     retry_wait(network, restart, category=category, source=name, file=path.name,
                                resume_bytes=current_size, reason='no-progress' if stalled else 'connection-interrupted')
                     continue
-                reason = 'no-progress' if stalled else 'slow-transfer' if slow else 'curl-' + str(process.returncode)
+                reason = 'no-progress' if stalled else 'slow-transfer' if slow else 'faster-source' if faster else 'curl-' + str(process.returncode)
                 alternatives = route_order(network, category, name, env)
                 if alternatives.index(route) + 1 < len(alternatives):
                     event(network, category=category, source=name, route=alternatives[alternatives.index(route)+1],
                           file=path.name, action='route-retry', reason=reason, resume_bytes=current_size)
                 else:
                     source_health(network, category, name, False)
-                    event(network, category=category, source=name, route=route, file=path.name, action='fallback', reason=reason, http_status=status, resume_bytes=current_size)
+                    event(network, category=category, source=name, route=route, file=path.name, action='fallback', reason=reason, http_status=status, resume_bytes=current_size,
+                          **(dict(detail=curl_message) if curl_message else {}))
                 break
         if model and partial.exists() and partial.stat().st_size:
             if not network.get('allow_model_restart'):
@@ -883,8 +1072,8 @@ MIN_GIT = (2, 17)
 def git_version(executable, env=None):
     """(major, minor) of a Git executable, or None when it cannot be run or read."""
     try:
-        output = subprocess.run([str(executable), '--version'], env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True, timeout=30, **hidden_console()).stdout
+        output = subprocess_output.run_external([str(executable), '--version'], env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, timeout=30, **hidden_console()).stdout
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
     found = re.search(r'git version (\d+)\.(\d+)', output or '')
@@ -915,14 +1104,14 @@ def clone(target, url, commit, *, sparse=None, run=None, network=None, env=None)
         command = [git, *command[1:]]
         if run:
             return run(label, command, env=env)
-        result = subprocess.run(list(map(str, command)), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **hidden_console())
+        result = subprocess_output.run_external(list(map(str, command)), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **hidden_console())
         if result.returncode:
             raise RuntimeError(result.stdout[-2500:])
     if target.exists():
         if not (target / '.git').exists():
             raise ValueError('Existing dependency is not a Git checkout of the pinned source: ' + str(target))
-        head = subprocess.check_output([git, '-C', str(target), 'rev-parse', 'HEAD'], env=env, text=True, **hidden_console()).strip()
-        dirty = subprocess.check_output([git, '-C', str(target), 'status', '--porcelain', '--untracked-files=no'], env=env, text=True, **hidden_console())
+        head = subprocess_output.output_external([git, '-C', str(target), 'rev-parse', 'HEAD'], env=env, **hidden_console()).strip()
+        dirty = subprocess_output.output_external([git, '-C', str(target), 'status', '--porcelain', '--untracked-files=no'], env=env, **hidden_console())
         if head != commit or dirty:
             raise ValueError('Existing dependency differs from the pinned clean source: ' + str(target))
         return target
@@ -958,7 +1147,7 @@ def clone(target, url, commit, *, sparse=None, run=None, network=None, env=None)
             finally:
                 env = original
             execute(target.name + '-checkout', ['git', '-C', temporary, 'checkout', '--detach', commit])
-            actual = subprocess.check_output([git, '-C', str(temporary), 'rev-parse', 'HEAD'], env=env, text=True, **hidden_console()).strip()
+            actual = subprocess_output.output_external([git, '-C', str(temporary), 'rev-parse', 'HEAD'], env=env, **hidden_console()).strip()
             if actual != commit:
                 raise ValueError('Downloaded source did not match its pinned commit')
             temporary.rename(target)

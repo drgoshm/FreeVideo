@@ -1,0 +1,14 @@
+.fv-ed-description-box{position:relative;display:flex;flex:1;min-width:0}
+.fv-ed-description-box .fv-ed-description{width:100%;min-height:36px;max-height:108px;line-height:18px;padding:8px 36px 8px 10px;border-radius:var(--fv-r-sm);resize:none;overflow-y:hidden}
+.fv-ed-expand,.fv-editor .fv-ed-expand,.fv-studio .fv-ed-expand{position:absolute;right:4px;bottom:4px;width:26px;height:26px;padding:4px;min-height:0;border:0;background:var(--fv-bg);color:var(--fv-muted)}
+.fv-ed-expand svg{width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.5;stroke-linecap:round;stroke-linejoin:round}
+.fv-ed-expand-dialog{box-sizing:border-box;position:fixed;inset:0;margin:auto;width:60vw;height:70dvh;max-width:calc(100vw - 32px);max-height:calc(100dvh - 32px);padding:20px;border:1px solid var(--fv-border);border-radius:var(--fv-r-lg);background:var(--fv-card);color:var(--fv-ink)}
+.fv-ed-expand-dialog[open]{display:flex;flex-direction:column;gap:16px}
+.fv-ed-expand-dialog::backdrop{background:color-mix(in srgb,var(--fv-bg) 75%,transparent)}
+.fv-ed-expand-dialog .fv-ed-expand-text{box-sizing:border-box;flex:1;min-height:0;height:auto;max-height:none;width:100%;resize:none;padding:12px;border:1px solid var(--fv-border);border-radius:var(--fv-r-sm);background:var(--fv-bg);color:var(--fv-ink);font:14px/1.6 var(--fv-font)}
+.fv-ed-expand-buttons{display:flex;justify-content:flex-end;gap:8px;flex:none}
+.fv-ed-expand-buttons button{height:36px;padding:0 16px;border-radius:var(--fv-r-sm);font:500 13px/1.4 var(--fv-font)}
+@media(max-width:680px){.fv-ed-description-box{width:100%;flex:1 1 100%;order:-1}}
+@media(max-width:400px){.fv-ed-expand-dialog{width:100vw;height:100dvh;max-width:100vw;max-height:100dvh;border-radius:0;padding:16px}}
+.fv-ed-expand-note{flex:none;min-height:0;font:13px/1.4 var(--fv-font);color:var(--fv-muted)}
+.fv-ed-expand-note:empty{display:none}

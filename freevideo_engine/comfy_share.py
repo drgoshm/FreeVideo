@@ -60,6 +60,9 @@ def details(root, identity):
     plan = summary.get('sampling_plan') or {}
     result['sampling_plan'] = {k: v for k, v in plan.items() if k in ('enabled', 'base_steps', 'refine_steps')
                                and type(v) in (int, bool)}
+    from .tiers import STEP_CACHES
+    if plan.get('step_cache') in STEP_CACHES[1:]:
+        result['sampling_plan']['step_cache'] = plan['step_cache']
     result['id'] = identity
     result['graph'] = saved_graph(path)
     return result

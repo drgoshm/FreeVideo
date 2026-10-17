@@ -3,6 +3,7 @@ import argparse
 from contextlib import redirect_stderr, redirect_stdout
 import gc
 import json
+import os
 from pathlib import Path
 import sys
 import time
@@ -32,6 +33,11 @@ def main():
             raise ValueError('Only the engine and native encoder use the resident worker')
         request = json.loads(Path(command[command.index('--request')+1]).read_text(encoding='utf-8'))
         with Path(message['log']).open('w', encoding='utf-8', buffering=1) as log, redirect_stdout(log), redirect_stderr(log):
+            if module == 'freevideo_engine.worker':
+                # As a worker started for one request logs before torch loads
+                # (see worker.py): the session has taken this request.
+                print(json.dumps({'event': 'worker_start', 'pid': os.getpid(), 'epoch': time.time(),
+                                  'resident': True}), flush=True)
             metrics = None
             diagnostics = None
             try:
@@ -39,7 +45,6 @@ def main():
                     from .encoder_diagnostics import EncoderTrace
                     diagnostics = EncoderTrace(request, resident=True)
                     diagnostics.stage('worker_import')
-                import os
                 selected = os.environ.get('PYTORCH_ALLOC_CONF', os.environ.get('PYTORCH_CUDA_ALLOC_CONF', ''))
                 if allocator is not None and allocator != selected:
                     # Allocation strategy is process initialization state. Do
@@ -74,7 +79,7 @@ def main():
                 if diagnostics is not None:
                     diagnostics.finish(False)
                 traceback.print_exc()
-                from .adaptive import classify_failure, cuda_runtime_error
+                from .adaptive import classify_failure, commit_exhausted, cuda_runtime_error
                 failure = classify_failure(error)
                 if request.get('metrics'):
                     from .monitoring import save
@@ -84,6 +89,9 @@ def main():
                     except (OSError, ValueError):
                         metrics = {}
                     failure = classify_failure(error, metrics)
+                    from .runtime_libraries import mismatch, diagnose
+                    if mismatch(error) and 'runtime_libraries' not in failure:
+                        failure['runtime_libraries'] = diagnose()
                     metrics.update(success=False, error=repr(error), failure=failure,
                                    work_seconds=time.perf_counter()-started)
                     save(path, metrics)
@@ -103,8 +111,14 @@ def main():
                 # failed with the same error. A fresh worker costs a reload.
                 if failure['kind'] == 'cuda_error' or cuda_runtime_error(error):
                     log.flush()
-                    import os
                     os._exit(74)
+                # An exhausted Windows commit limit includes what this process
+                # still holds, notably resident models charged by WDDM. Cleanup
+                # cannot be trusted to return it, and every later request would
+                # fail the same way. A fresh worker starts from zero.
+                if commit_exhausted(error):
+                    log.flush()
+                    os._exit(75)
                 failed_error = error
 
             # ModelBank cannot own tensors held by an exception's traceback.
@@ -142,7 +156,6 @@ def main():
                 # A failed cleanup must not admit another model over whatever
                 # remains. The controller may start a fresh worker on retry.
                 log.flush()
-                import os
                 os._exit(75)
             return 1
     serve(args.endpoint, run, snapshot)

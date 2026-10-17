@@ -1,0 +1,22 @@
+.fv-ed-adjust-picture .fv-ed-adjust-slider{flex:1.2}
+.fv-ed-adjust-picture .fv-ed-adjust-slider output[hidden]{display:none}
+.fv-ed-adjust-picture .fv-ed-adjust-row:has(.fv-ed-adjust-segmented){flex-direction:column;align-items:stretch}
+.fv-ed-adjust-picture .fv-ed-adjust-row:has(.fv-ed-adjust-segmented) .fv-ed-adjust-row-controls{width:100%}
+.fv-ed-adjust-picture .fv-ed-adjust-row:has(button) .fv-ed-adjust-row-controls{justify-content:stretch}
+.fv-ed-adjust-picture .fv-ed-adjust-row button{flex:1;font-size:11px;padding:0 4px;white-space:normal;line-height:1.15}
+.fv-ed-adjust-picture button[aria-pressed=true]{color:var(--fv-accent);border-color:var(--fv-accent)}
+.fv-ed-adjust-picture .fv-ed-adjust-row[hidden],.fv-ed-adjust-picture button[hidden]{display:none}
+/* Leave a visible picture and its handles alongside the drawer on phones. */
+@media(max-width:560px){
+ .fv-editor[data-adjust-open=true] .fv-ed-preview,.fv-editor[data-adjust-open=true] .fv-ed-transport{margin-right:220px}
+ .fv-editor .fv-ed-adjust-host{width:220px}
+ .fv-ed-adjust-picture .fv-ed-adjust-row:has([data-axis]){flex-direction:column;align-items:stretch}
+}
+
+.fv-ed-adjust-picture .fv-ed-adjust-number{position:relative;display:flex;align-items:center;gap:3px;flex:0 0 auto}
+.fv-ed-adjust-picture .fv-ed-adjust-number[data-axis]:before{content:attr(data-axis);font-size:11px;color:var(--fv-muted)}
+.fv-ed-adjust-picture .fv-ed-adjust-number[data-unit]:after{content:attr(data-unit);position:absolute;right:8px;top:50%;transform:translateY(-50%);font-size:11px;color:var(--fv-muted);pointer-events:none}
+.fv-editor .fv-ed-adjust-picture .fv-ed-adjust-number input{box-sizing:border-box;width:76px;min-width:0;padding:4px 22px 4px 8px}
+
+.fv-ed-picture-input-error{margin:0;color:var(--fv-warning);font-size:12px}
+.fv-ed-picture-input-error[hidden]{display:none}

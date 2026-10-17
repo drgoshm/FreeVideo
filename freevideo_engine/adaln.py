@@ -12,6 +12,20 @@ from safetensors.torch import load_file, save_file
 import torch
 
 
+def all_finite(tensor):
+    """Whether every element is finite; reads half-precision bits instead of calling isfinite.
+
+    A bfloat16 or float16 table is finite exactly when its exponent field is not
+    all ones, so one integer mask answers the question about ten times faster on
+    the CPU than isfinite() on those dtypes.
+    """
+    mask = {torch.bfloat16: 0x7F80, torch.float16: 0x7C00}.get(tensor.dtype)
+    if mask is None:
+        return bool(torch.isfinite(tensor).all())
+    bits = tensor.reshape(-1).view(torch.int16)
+    return not bool((bits & mask).eq(mask).any())
+
+
 class ScheduleCursor:
     def __init__(self, timesteps):
         self.timesteps = timesteps
@@ -38,17 +52,27 @@ class CachedModulation(torch.nn.Module):
         self.steps = len(values)
         for index, values_at_step in enumerate(values):
             self.register_buffer(f'step_{index}', torch.cat(values_at_step, dim=-1))
+        # Steps differ in how many distinct timesteps they carry: the first H3
+        # step has video and audio at the same t, so its rows are fewer. The
+        # fused pre/post kernels compile for static shapes and recompiled in the
+        # second step, mid-request and beside a full step's activations. Rows
+        # past a step's own timesteps are never indexed, so the narrower steps
+        # repeat their last row up to the widest step; stored tables are unchanged.
+        self.rows = max(len(getattr(self, f'step_{index}')) for index in range(self.steps))
 
     def forward(self, temb):
         if self.cursor.index < 0:
             raise RuntimeError('AdaLN schedule has not started')
-        return getattr(self, f'step_{self.cursor.index}').chunk(6, dim=-1)
+        values = getattr(self, f'step_{self.cursor.index}')
+        if len(values) < self.rows:
+            values = torch.cat((values, values[-1:].expand(self.rows - len(values), -1)))
+        return values.chunk(6, dim=-1)
 
 
 class TableCache:
     """Persist fixed modulation constants by weights, schedule and layout."""
     def __init__(self, root, source_id, steps, task='t2va', *, manifest=None,
-                 timesteps=None, channels=5376, device='cuda'):
+                 timesteps=None, channels=5376, device='cuda', fetch=True):
         from . import adaln_assets as assets
         from .monitoring import save
         times = schedule_timesteps(steps, device='cpu', task=task) if timesteps is None else timesteps
@@ -62,6 +86,8 @@ class TableCache:
         self.optional_loaded = set()
         self.optional_downloaded = set()
         self.optional_download_bytes = 0
+        self.fetch = fetch
+        self.placeholders = set()
         self.root = Path(root) / assets.directory(self.identity)
         self.producer = None
         self.shared = None
@@ -94,7 +120,12 @@ class TableCache:
                         from src.inference.render import KEYFRAME_NOISE_AUG
                         if old.get('keyframe_noise_aug') != KEYFRAME_NOISE_AUG:
                             continue
-                    legacy_times = [t.tolist() for t in schedule_timesteps(steps, device='cpu', task=old['task'])]
+                    # A legacy table follows the grid this machine's own linspace
+                    # gave the version that wrote it. Where that is not the
+                    # engine's grid the table belongs to other timesteps: keep
+                    # it on disk and do not relabel it.
+                    legacy_times = [t.tolist() for t in schedule_timesteps(steps, device='cpu', task=old['task'],
+                                                                          upstream_grid=True)]
                     if legacy_times != rows:
                         continue
                     files = []
@@ -110,6 +141,10 @@ class TableCache:
                 self.producer = dict(old, migrated_from='verified-legacy-contract-v1')
                 self.asset = dict(identity=self.identity, directory=candidate.name, files=files, producer=self.producer)
                 return
+        if not fetch:
+            # Compiling ahead of a request reads the tables on disk and writes
+            # nothing; a table that is not there is not fetched (see load).
+            return
         self.root.mkdir(parents=True, exist_ok=True)
         marker = self.root / 'identity.json'
         if marker.exists():
@@ -134,6 +169,8 @@ class TableCache:
             if row is None:
                 raise ValueError('Incomplete AdaLN model asset')
         elif not path.is_file() or not marker.is_file():
+            if not self.fetch:
+                return self.placeholder(index)
             if self.optional_asset is None:
                 return None
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,9 +188,22 @@ class TableCache:
         # These are small immutable constants; their producer's GPU/runtime is
         # deliberately irrelevant. Validate before transferring to this device.
         state = load_file(path, device=self.device)
-        if any(not bool(torch.isfinite(tensor).all()) for tensor in state.values()):
+        if any(not all_finite(tensor) for tensor in state.values()):
             raise ValueError('Nonfinite AdaLN model asset')
         return [state[f'step_{i}'].chunk(6, dim=-1) for i in range(steps)]
+
+    def placeholder(self, index):
+        """Zeros in a missing table's shape and dtype, for compiling only.
+
+        The fused block kernels compile for these shapes; no value reaches one.
+        A request installs or computes the real table before it samples.
+        """
+        if self.identity['dtype'] != 'BF16':
+            raise ValueError('Unsupported AdaLN table dtype')
+        self.placeholders.add(index)
+        width = self.identity['channels'] * self.identity['components']
+        return [torch.zeros(len(times) * self.identity['modality_rows'], width, dtype=torch.bfloat16,
+                            device=self.device).chunk(6, dim=-1) for times in self.identity['timesteps']]
 
     def save(self, index, module, *, producer_device=None):
         from . import adaln_assets as assets
@@ -163,7 +213,7 @@ class TableCache:
         path = self.root / f'{index:02d}.safetensors'
         temporary = path.with_suffix('.partial')
         state = {name: tensor.cpu() for name, tensor in module.state_dict().items()}
-        if any(not bool(torch.isfinite(tensor).all()) for tensor in state.values()):
+        if any(not all_finite(tensor) for tensor in state.values()):
             raise ValueError('Cannot save nonfinite AdaLN constants')
         save_file(state, temporary)
         row = {'bytes': temporary.stat().st_size, 'sha256': assets.file_hash(temporary)}
@@ -188,12 +238,15 @@ class TableCache:
 
 
 @torch.no_grad()
-def schedule_timesteps(steps, video_shift=12., audio_shift=3., device='cuda', task='t2va'):
+def schedule_timesteps(steps, video_shift=12., audio_shift=3., device='cuda', task='t2va', upstream_grid=False):
     from .media_request import TASKS
     if task not in TASKS:
         raise ValueError('Unsupported AdaLN task')
-    from diffusers import MiniMaxH3Scheduler
-    video, audio = MiniMaxH3Scheduler(shift=video_shift), MiniMaxH3Scheduler(shift=audio_shift)
+    if upstream_grid:
+        from diffusers import MiniMaxH3Scheduler as scheduler
+    else:
+        from .step_grid import scheduler
+    video, audio = scheduler(shift=video_shift), scheduler(shift=audio_shift)
     video.set_timesteps(steps, device=device)
     audio.set_timesteps(steps, device=device)
     return modality_timesteps(video.timesteps, audio.timesteps, task)

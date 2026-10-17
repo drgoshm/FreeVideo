@@ -1,0 +1,115 @@
+{
+  "version": "14.4.0",
+  "host_compiler_below": {
+    "12.9": 15,
+    "13.0": 16
+  },
+  "micromamba": {
+    "version": "2.9.0-0",
+    "url": "https://github.com/mamba-org/micromamba-releases/releases/download/2.9.0-0/micromamba-linux-64",
+    "sha256": "366cd9cd8be14df1ab8ed50352a82111082a36686b2d389fdb79a92c3fafb3e3",
+    "bytes": 18292808
+  },
+  "channels": {
+    "official": "https://conda.anaconda.org/conda-forge",
+    "tuna": "https://mirrors.tuna.tsinghua.edu.cn/anaconda/cloud/conda-forge",
+    "nju": "https://mirror.nju.edu.cn/anaconda/cloud/conda-forge"
+  },
+  "packages": [
+    {
+      "path": "linux-64/_openmp_mutex-4.5-20_gnu.conda",
+      "sha256": "1dd3fffd892081df9726d7eb7e0dea6198962ba775bd88842135a4ddb4deb3c9",
+      "bytes": 28948
+    },
+    {
+      "path": "linux-64/binutils_impl_linux-64-2.46.1-default_hfdba357_103.conda",
+      "sha256": "98f9ddc6dc5d56a824b7eaea5bab6ad4bb47642288fc70d6b1b4024ac39d5595",
+      "bytes": 3706604
+    },
+    {
+      "path": "linux-64/binutils_linux-64-2.46.1-default_h4852527_103.conda",
+      "sha256": "606a42c754752fb905fe2012d52ff370d47b5b6adefd5f7befc4ec30ce758f23",
+      "bytes": 36335
+    },
+    {
+      "path": "linux-64/gcc_impl_linux-64-14.4.0-h4b2a866_7.conda",
+      "sha256": "fe3d0c2cbd59755ddd8364c79b8e1a09b3125581d9df07170f102bc150740632",
+      "bytes": 78647149
+    },
+    {
+      "path": "linux-64/gcc_linux-64-14.4.0-hc469d41_2.conda",
+      "sha256": "082fb68319027d485cc9b4d8effc3faa49d2edb13bc530f849acd321c8cfb6c2",
+      "bytes": 30385
+    },
+    {
+      "path": "linux-64/gxx_impl_linux-64-14.4.0-hc436dd5_7.conda",
+      "sha256": "8082bf31bf210f55ab3e69bbc301e5131b8fe2986c743b4d4486d469dc737ac3",
+      "bytes": 15847507
+    },
+    {
+      "path": "linux-64/gxx_linux-64-14.4.0-h0047a55_2.conda",
+      "sha256": "9801d3b03494c5530e6574eae1055d8b5bbb99d0ac75d3bca8757c17a2f3a001",
+      "bytes": 28787
+    },
+    {
+      "path": "linux-64/ld_impl_linux-64-2.46.1-default_hbd61a6d_103.conda",
+      "sha256": "901649b1edbe841fd4ee7e2d491a05184ed540eb01cdae506872f344babc1d28",
+      "bytes": 742109
+    },
+    {
+      "path": "linux-64/libgcc-16.2.0-ha9f2e26_7.conda",
+      "sha256": "e031634c3a928f9594eba868bc46ef5230d6571a364a0c63215b06c4563bfcea",
+      "bytes": 1058444
+    },
+    {
+      "path": "linux-64/libgomp-16.2.0-he0feb66_7.conda",
+      "sha256": "92a0bb350c7be6a4eedcb4e111c60aefd176018e6b1c009a6e025dbe9bbcd758",
+      "bytes": 640566
+    },
+    {
+      "path": "linux-64/libsanitizer-14.4.0-hf39dbba_7.conda",
+      "sha256": "7a4c47d699e6e9640aa8061f461ab31e71ba7d41994a451ea1e79a3801e8f6c3",
+      "bytes": 7211298
+    },
+    {
+      "path": "linux-64/libstdcxx-16.2.0-h934c35e_7.conda",
+      "sha256": "fa7018298629fc429971fffd6ecba3d27a7b02e4e890d6a93ea01ffebe8cb745",
+      "bytes": 6615436
+    },
+    {
+      "path": "linux-64/libzlib-1.3.2-h25fd6f3_3.conda",
+      "sha256": "eb8a0db0aa570124f7d2a93d7c7f596e3390df5e047818d873baad32985fc736",
+      "bytes": 63713
+    },
+    {
+      "path": "linux-64/zstd-1.5.7-hb78ec9c_7.conda",
+      "sha256": "47d682b9f6d6ec9eb1a6e6c3e75ea6273e899e78fb7fc59f81d39745009fbc60",
+      "bytes": 601301
+    },
+    {
+      "path": "noarch/kernel-headers_linux-64-5.14.0-he073ed8_3.conda",
+      "sha256": "c4d973dd80ab10028b3e4c58c1c6d8f437bfeaf6069dafb1130dabc550e9caf4",
+      "bytes": 1410267
+    },
+    {
+      "path": "noarch/libgcc-devel_linux-64-14.4.0-hd9a9cd0_107.conda",
+      "sha256": "fb09fdc5d12cc929ff0af73fbd7cf33be7b473a46fe11353a21ec1ffa468c657",
+      "bytes": 3090192
+    },
+    {
+      "path": "noarch/libstdcxx-devel_linux-64-14.4.0-ha5b54cb_107.conda",
+      "sha256": "a518b2878cecd324082d334d36907156b68074b18736c111b15ff34efcb22aaf",
+      "bytes": 19512223
+    },
+    {
+      "path": "noarch/sysroot_linux-64-2.34-h087de78_3.conda",
+      "sha256": "08c50c314b331730eeb8f87c39a45e5426a5463e078392ab283e2552d753443e",
+      "bytes": 40779381
+    },
+    {
+      "path": "noarch/tzdata-2026c-h151e31d_0.conda",
+      "sha256": "b928c30ddcb0e3f544c6eade8352737e6e610e263276b90232db6a578ef899d8",
+      "bytes": 118849
+    }
+  ]
+}

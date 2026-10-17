@@ -8,10 +8,59 @@ import argparse
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import time
 from .monitoring import save
 from .processes import worker_signals
+
+PACKAGE = Path(__file__).resolve().parent
+
+
+def resolve_encoder(folder_paths, name):
+    files = json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8'))
+    expected = next((row['bytes'] for row in files if row['file'] == 'text_encoders/' + name), None)
+    path = None
+    copies = {}
+    if expected is not None:
+        folders = folder_paths.get_folder_paths('text_encoders')
+        models_dir = getattr(folder_paths, 'models_dir', None)
+        if models_dir is not None:
+            models_dir = os.path.normcase(os.path.realpath(models_dir))
+            freevideo, bundled = [], []
+            # FreeVideo paths stay preferred after a resident worker registers them.
+            for folder in folders:
+                resolved = os.path.normcase(os.path.realpath(folder))
+                try:
+                    in_models = os.path.commonpath([models_dir, resolved]) == models_dir
+                except ValueError:
+                    in_models = False  # Different Windows drives cannot share a model root.
+                (bundled if in_models else freevideo).append(folder)
+            folders = freevideo + bundled
+        for folder in folders:
+            candidate = os.path.realpath(os.path.join(folder, name))
+            if candidate in copies:
+                continue
+            try:
+                info = Path(candidate).stat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                continue
+            copies[candidate] = info.st_size
+            if path is None and info.st_size == expected:
+                path = candidate
+    if path is None:
+        path = folder_paths.get_full_path_or_raise('text_encoders', name)
+    checkpoint = dict(state='read_only_mmap' if sys.platform == 'win32' else 'native_mmap',
+                      bytes=Path(path).stat().st_size)
+    if expected is not None:
+        checkpoint.update(expected_bytes=expected, tested_size=checkpoint['bytes'] == expected)
+        selected = os.path.realpath(path)
+        mismatched = sum(size != expected for candidate, size in copies.items() if candidate != selected)
+        if mismatched:
+            checkpoint['mismatched_copies'] = mismatched
+    return path, checkpoint
 
 
 def encoder_on_gpu(clip):
@@ -67,6 +116,10 @@ def preload(clip, request, resident):
     except (PreloadCancelled, MemoryError, torch.OutOfMemoryError) as error:
         resident.drop('encoder', 'Speculative preload interrupted; foreground work wins')
         result.update(state='cancelled' if isinstance(error, PreloadCancelled) else 'released', reason=str(error))
+    except Exception:
+        # An unfinished placement left its weights where they were; never keep it.
+        resident.drop('encoder', 'Speculative preload failed; partial placement discarded')
+        raise
     result.update(gpu_bytes_after=gpu_bytes(clip), elapsed_seconds=time.perf_counter()-started,
                   torch_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
                   torch_peak_reserved_bytes=torch.cuda.max_memory_reserved())
@@ -96,6 +149,9 @@ def main():
             record.update(success=False, error=repr(error), work_seconds=time.perf_counter() - started)
             from .adaptive import classify_failure
             record['failure'] = classify_failure(error)
+            from .runtime_libraries import mismatch, diagnose
+            if mismatch(error):
+                record['failure']['runtime_libraries'] = diagnose()
             save(request['metrics'], record)
             if 'torch' in sys.modules and sys.modules['torch'].cuda.is_initialized():
                 from .encoder_memory import failure_resources
@@ -110,14 +166,97 @@ def main():
         raise
 
 
+def start_read_ahead(trace, path, request):
+    """Read the checkpoint into the OS cache while the model is copied to the device.
+
+    Speculative: any failure here leaves the loader exactly as before. Once per
+    request: a later attempt's copy does not start it again."""
+    if getattr(trace, 'read_ahead', None) is not None or 'encoder_read_ahead' in trace.data:
+        return
+    try:
+        from .encoder_read_ahead import EncoderReadAhead
+        trace.read_ahead = EncoderReadAhead(path, ram_budget_bytes=request.get('ram_budget_bytes')).start()
+    except Exception as error:
+        trace.data['encoder_read_ahead'] = dict(state='failed', reason=type(error).__name__ + ': ' + str(error))
+
+
+def stop_read_ahead(trace):
+    """Stop the checkpoint read-ahead, once, and keep what it read in the metrics."""
+    reader = getattr(trace, 'read_ahead', None)
+    if reader is not None and 'encoder_read_ahead' not in trace.data:
+        trace.data['encoder_read_ahead'] = reader.close()
+
+
+def start_layer_window(trace, clip, path):
+    """Read the streamed layers ahead of the forward pass when the whole-file read-ahead could not.
+
+    Speculative like the readers above: any failure leaves the encode exactly as before. Once per request."""
+    if getattr(trace, 'layer_window', None) is not None or 'encoder_window' in trace.data:
+        return
+    if os.environ.get('FREEVIDEO_ENCODER_WINDOW', 'auto').lower() in ('off', '0', 'false'):
+        trace.data['encoder_window'] = dict(state='skipped', reason='Disabled by FREEVIDEO_ENCODER_WINDOW')
+        return
+    if (trace.data.get('encoder_read_ahead') or {}).get('state') == 'ready':
+        trace.data['encoder_window'] = dict(state='skipped', reason='The whole checkpoint is already in the OS cache')
+        return
+    try:
+        from .encoder_checkpoint import owns_readonly_tensor
+        from .encoder_window import LayerWindow, layer_modules
+        modules = layer_modules(clip.cond_stage_model, owns_readonly_tensor)
+        release = os.environ.get('FREEVIDEO_ENCODER_WINDOW_RELEASE', 'auto').lower() not in ('off', '0', 'false')
+        trace.layer_window = window = LayerWindow(path, modules, release=release)
+        window.start()
+    except Exception as error:
+        trace.data['encoder_window'] = dict(state='failed', reason=type(error).__name__ + ': ' + str(error))
+
+
+def stop_layer_window(trace):
+    """Stop the layer window, once, and keep what it did in the metrics."""
+    window = getattr(trace, 'layer_window', None)
+    if window is not None and 'encoder_window' not in trace.data:
+        trace.data['encoder_window'] = window.close()
+
+
+def start_model_read_ahead(trace, request):
+    """On a slow drive, read the video model's files while the encoder computes.
+
+    Speculative and bounded like the checkpoint reader: any failure leaves the
+    model load exactly as before. Once per request."""
+    cache = request.get('model_cache')
+    if not cache or getattr(trace, 'model_read_ahead', None) is not None or 'model_read_ahead' in trace.data:
+        return
+    try:
+        from .model_read_ahead import ModelReadAhead
+        # Recorded before the thread starts: an interrupt during start() still finds it to close.
+        reader = trace.model_read_ahead = ModelReadAhead(
+            cache=cache, resident_blocks=request.get('model_resident_blocks'), headroom_bytes=request.get('model_headroom_bytes'),
+            ram_budget_bytes=request.get('ram_budget_bytes'),
+            budget_is_estimate=bool(request.get('ram_budget_is_estimate')))
+        reader.start()
+    except Exception as error:
+        trace.data['model_read_ahead'] = dict(state='failed', reason=type(error).__name__ + ': ' + str(error))
+
+
+def stop_model_read_ahead(trace):
+    """Stop the model read-ahead, once, and keep what it read in the metrics."""
+    reader = getattr(trace, 'model_read_ahead', None)
+    if reader is not None and 'model_read_ahead' not in trace.data:
+        trace.data['model_read_ahead'] = reader.close()
+
+
 def encode(args, request, resident=None, diagnostics=None):
     from .encoder_diagnostics import EncoderTrace
     trace = diagnostics or EncoderTrace(request, resident=resident is not None)
     try:
         metrics = _encode(args, request, resident, trace)
     except BaseException:
+        stop_read_ahead(trace)
+        stop_layer_window(trace)
+        stop_model_read_ahead(trace)
         trace.finish(False)
         raise
+    stop_read_ahead(trace)
+    stop_model_read_ahead(trace)
     result = trace.finish(True, metrics)
     if not args.check_library and not request.get('idle_preload'):
         print(json.dumps({'event': 'encoder_complete', **result}), flush=True)
@@ -128,6 +267,12 @@ def _encode(args, request, resident, trace):
     loading = trace.data
     def phase(name, **metrics):
         trace.stage(name, **metrics)
+        if args.check_library:
+            from .install_activity import step
+            labels = {'encoder_torch_import': 'Runtime libraries importing',
+                      'encoder_options': 'Encoder configuring', 'encoder_native_import': 'Encoder importing'}
+            if name in labels:
+                step(labels[name])
         if name in ('encoder_oom', 'encoder_retry'):
             print(json.dumps(dict(event=name, attempt=len(loading.get('encoder_attempts', [])))), flush=True)
         if name == 'encoder_oom' and request.get('metrics') and request.get('diagnostic_output'):
@@ -198,6 +343,8 @@ def _encode(args, request, resident, trace):
             raise RuntimeError('Unexpected application modules: ' + repr(forbidden))
         print(json.dumps({'native_encoder_library_import': True, 'application_modules_loaded': [],
                           'torch': str(torch.__version__), 'source': str(args.comfy_root)}), flush=True)
+        from .install_activity import step
+        step('Encoder ready')
         return
     phase('encoder_media_prepare')
     keyframes = request.get('keyframes')
@@ -205,12 +352,18 @@ def _encode(args, request, resident, trace):
     normalized = None
     media_kwargs = {}
     task = 't2va'
+    early_reference = None
     if request.get('media'):
-        from .media_request import task_for
+        from .media_request import task_for, reference_stages
         from .media_encoding import prepare
-        task = task_for(request['media'])
+        stages = reference_stages(request['media'])
+        early = [dict(reference_index=i, early_steps=row['early_steps'])
+                 for i, row in enumerate(request['media'].get('references', [])) if 'early_steps' in row]
+        if early:
+            early_reference = dict(version=1, early_steps=early, conditions=[])
+        task = task_for(stages[0][1])
         if task != 't2va':
-            normalized, media_kwargs = prepare(request['media'], request['geometry'], Path(request['output']).parent / 'media')
+            normalized, media_kwargs = prepare(stages[0][1], request['geometry'], Path(request['output']).parent / 'media')
             # Saved with the conditioning, so a reused input cache still reports them.
             loading['reference_trims'] = [row['trimmed'] for row in normalized if row.get('trimmed')]
     if keyframes is not None:
@@ -227,9 +380,7 @@ def _encode(args, request, resident, trace):
     from freevideo_engine.conditioning import to_cache
     phase('encoder_lookup')
     name = request.get('encoder', 'qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors')
-    path = folder_paths.get_full_path_or_raise('text_encoders', name)
-    loading['checkpoint'] = dict(state='read_only_mmap' if sys.platform == 'win32' else 'native_mmap',
-                                 bytes=Path(path).stat().st_size)
+    path, loading['checkpoint'] = resolve_encoder(folder_paths, name)
     print(json.dumps({'event': 'encoder_cache_lookup', 'encoder': name}), flush=True)
     phase('encoder_load')
     # Same native loader and model type as CLIPLoader; CPU initialization prevents
@@ -306,6 +457,13 @@ def _encode(args, request, resident, trace):
     checkpoint_paths = [path]
     def timed_load(*values, **kwargs):
         phase('encoder_device_load', load_seconds=load_seconds)
+        # A retry copies the encoder again: the model's reader, started after
+        # the first copy, ends first and is not started a second time.
+        stop_model_read_ahead(trace)
+        if not encoder_cache_hit:
+            # Only for the copy: reads that overlapped the library import or
+            # the model's construction slowed them (see encoder_read_ahead).
+            start_read_ahead(trace, path, request)
         print(json.dumps({'event': 'encoder_device_reuse' if encoder_on_gpu(clip) else 'encoder_device_load_start'}), flush=True)
         tick = time.perf_counter()
         import comfy.model_management as memory
@@ -314,6 +472,9 @@ def _encode(args, request, resident, trace):
             memory.EXTRA_RESERVED_VRAM = max(memory.EXTRA_RESERVED_VRAM, current['need'] - int(.8 * 2**30))
         result = native_load(*values, **kwargs)
         torch.cuda.synchronize()
+        stop_read_ahead(trace)
+        if not encoder_cache_hit:
+            start_model_read_ahead(trace, request)
         transfer_seconds[0] += time.perf_counter() - tick
         phase('encoder_page_release', device_load_seconds=transfer_seconds[0])
         # The checkpoint's pages are dead weight once its weights are on the
@@ -355,6 +516,8 @@ def _encode(args, request, resident, trace):
         phase('encoder_compute', load_seconds=load_seconds, device_load_seconds=transfer_seconds[0],
               gpu=snapshot(torch, clip, memory))
         print(json.dumps({'event': 'encoder_compute_start'}), flush=True)
+        if not encoder_cache_hit:
+            start_layer_window(trace, clip, path)
         return result
     @contextmanager
     def attempt(index, failure):
@@ -392,6 +555,26 @@ def _encode(args, request, resident, trace):
             encoded, attempts = encode_with_recovery(clip, tokens, memory, torch, phase, max_attempts=4,
                                                      attempt=attempt)
         loading['encoder_attempts'] = attempts
+        if early_reference is not None:
+            # Reuse this loaded Qwen instance, its precision and recovery policy.
+            # Re-tokenize: removing visual rows alone does not remove VL features.
+            from .media_encoding import reference_options
+            extra_started = time.perf_counter()
+            for step, stage_media in stages[1:]:
+                tokens = clip.tokenize(prompt, **reference_options(normalized, media_kwargs, step))
+                size = input_size(tokens)
+                current.clear()
+                with readonly_pinning(torch, memory):
+                    stage_encoded, stage_attempts = encode_with_recovery(
+                        clip, tokens, memory, torch, phase, max_attempts=4, attempt=attempt)
+                stage_task = task_for(stage_media)
+                stage_value = to_cache(stage_encoded, prompt, task=stage_task)
+                stage_value['task'] = stage_task
+                early_reference['conditions'].append(dict(start_step=step, value=stage_value))
+                loading.setdefault('early_reference_attempts', []).append(dict(start_step=step, attempts=stage_attempts))
+                del stage_encoded
+            torch.cuda.synchronize()
+            loading['early_reference_extra_encode_seconds'] = time.perf_counter() - extra_started if stages[1:] else 0.
         # Finish async forward work at the existing conditioning boundary, so
         # it is not attributed to packing/saving on the host.
         torch.cuda.synchronize()
@@ -400,6 +583,7 @@ def _encode(args, request, resident, trace):
         phase('encoder_conditioning_pack', gpu=snapshot(torch, clip, memory))
     finally:
         del clip.load_model
+        stop_layer_window(trace)
         guard.disarm()
         if reader is not None:
             reader.close()
@@ -408,8 +592,12 @@ def _encode(args, request, resident, trace):
     task = 'fl2va' if images is not None else task
     value = to_cache(encoded, prompt, task=task)
     value['task'] = task
+    if early_reference is not None:
+        value['early_reference'] = early_reference
     torch.cuda.synchronize()
     prompt_encode_seconds = time.perf_counter() - encode_started
+    # Keyframe and reference-media encoding read the drive themselves.
+    stop_model_read_ahead(trace)
     keyframe_metrics = {}
     if images is not None:
         phase('keyframe_vae')
@@ -460,6 +648,10 @@ def _encode(args, request, resident, trace):
         info = encode_latents(normalized, value, request['base'], request['geometry'], resident=resident)
         keyframe_metrics.update(media_vae_encode_seconds=time.perf_counter() - tick, conditioning_info=info)
         task = info['task']
+    elif early_reference is not None:
+        from .media_conditioning import describe
+        keyframe_metrics['conditioning_info'] = describe(value, **{
+            k: request['geometry'][k] for k in ('width', 'height', 'frames')})
     phase('encoder_save')
     output = Path(request['output'])
     output.parent.mkdir(parents=True, exist_ok=True)

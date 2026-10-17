@@ -29,7 +29,7 @@ def tile_group_size(allocator_bytes, *, cache_weights=True):
 
 
 def decode_to_file(latents, audio_latents, output, *, base, artifacts_dir,
-                   budget_bytes=4 * 2**30, reserve_bytes=2 * 2**30, cache_weights=True):
+                   budget_bytes=4 * 2**30, reserve_bytes=2 * 2**30, cache_weights=True, output_size=None):
     if type(cache_weights) is not bool:
         raise ValueError('Decoder weight caching must be explicitly enabled or disabled')
     from .macos_vdn import activate
@@ -83,7 +83,7 @@ def decode_to_file(latents, audio_latents, output, *, base, artifacts_dir,
                 handles.append(layer.register_forward_pre_hook(guard))
             mean = torch.tensor(vae.config.latents_mean, device='mps').view(1, -1, 1, 1, 1)
             std = torch.tensor(vae.config.latents_std, device='mps').view(1, -1, 1, 1, 1)
-            phase('Decoding video tiles')
+            phase('Decoding the video')
             def progress(done, total, elapsed):
                 print(json.dumps(dict(event='decode_progress', done=done, total=total,
                                       elapsed_seconds=elapsed)), flush=True)
@@ -126,7 +126,13 @@ def decode_to_file(latents, audio_latents, output, *, base, artifacts_dir,
             phase('Saving MP4 and audio')
             output.parent.mkdir(parents=True, exist_ok=True)
             temporary = output.with_name(output.stem + '.partial' + output.suffix)
-            encode_video(frames, fps=FPS, output_path=str(temporary), audio=audio, audio_sample_rate=rate)
+            if output_size is not None:
+                # The model rendered a larger size; only the picture is scaled.
+                from .output_fit import fit_frames
+                encode_video(fit_frames(frames, *output_size), fps=FPS, output_path=str(temporary), audio=audio,
+                             audio_sample_rate=rate)
+            else:
+                encode_video(frames, fps=FPS, output_path=str(temporary), audio=audio, audio_sample_rate=rate)
             temporary.replace(output)
             return dict(device_backend='mps', output=str(output), frames=len(frames),
                 audio_sample_rate=rate, audio_shape=list(audio.shape), elapsed_seconds=time.monotonic()-started,

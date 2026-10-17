@@ -30,7 +30,29 @@ def _kernel():
     ''')
 
 
-def decode_weight(weight, dtype, device):
+def row_storage(weight, row_range):
+    """Select output rows on the host, including only their 128-row scale tiles.
+
+    NVFP4 scales are swizzled in independent 128 by 4 tiles. Selecting packed
+    rows alone and slicing the swizzled scale vector at the same index is wrong.
+    Unblock the intersecting complete row tiles, then take the requested rows.
+    This also supports unaligned ranges and padded original shapes.
+    """
+    from comfy_kitchen.float_utils import from_blocked
+    packed, params = weight._qdata, weight._params
+    start, stop = row_range
+    if not (type(start) is int and type(stop) is int
+            and 0 <= start < stop <= params.orig_shape[0]):
+        raise ValueError('Invalid NVFP4 output row range')
+    columns = packed.shape[1] * 2
+    first, last = start // 128, (stop + 127) // 128
+    tile_size = 128 * ((columns // 16 + 3) // 4 * 4)
+    blocked = params.block_scale.reshape(-1)[first * tile_size:last * tile_size]
+    scales = from_blocked(blocked, num_rows=(last - first) * 128, num_cols=columns // 16)
+    return packed[start:stop], scales[start - first * 128:stop - first * 128].float()
+
+
+def decode_weight(weight, dtype, device, *, row_range=None):
     """Match nvfp4_weight's nibble order, scale order and padded output view."""
     import torch
     from comfy_kitchen.float_utils import from_blocked
@@ -54,7 +76,12 @@ def decode_weight(weight, dtype, device):
         raise ValueError('Invalid NVFP4 scale or original shape geometry')
     # Unblocking the small scale plane is CPU work; the expanded weight never
     # occupies a full CPU FP32 matrix. Preserve the reference's two multiplies.
-    scales = from_blocked(params.block_scale, num_rows=rows, num_cols=columns // 16).float()
+    if row_range is None:
+        scales = from_blocked(params.block_scale, num_rows=rows, num_cols=columns // 16).float()
+    else:
+        packed, scales = row_storage(weight, row_range)
+        rows = row_range[1] - row_range[0]
+        original = (rows, original[1])
     result = torch.empty((rows, columns), dtype=dtype, device=device)
     packed_device = packed.to(device)
     scales_device = scales.contiguous().to(device)

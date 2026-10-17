@@ -1,0 +1,16 @@
+const el = (tag, cls, text) => { const e = document.createElement(tag); if (cls) e.className = cls; if (text) e.textContent = text; return e; };
+// The label and switch alone: the name, the hover text and nothing else.
+// Shared by the studio and the editing view; neither pulls in the other.
+export function firstFrameRow(t, className) {
+    const row = el('label', className, t('First-frame reference', '首帧参考'));
+    row.title = t('Reduces drift', '减小漂移');
+    const input = el('input'); input.type = 'checkbox'; input.setAttribute('role', 'switch');
+    input.setAttribute('aria-label', t('First-frame reference', '首帧参考'));
+    row.append(input);
+    const purpose = row.title;
+    return {row, input, setDisabled(disabled) {
+        input.disabled = disabled;
+        input.title = '';
+        row.title = disabled ? '' : purpose;
+    }};
+}

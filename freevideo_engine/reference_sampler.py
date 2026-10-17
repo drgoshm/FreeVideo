@@ -9,7 +9,6 @@ import time
 
 import torch
 
-from diffusers import MiniMaxH3Scheduler
 from diffusers.modular_pipelines.minimax_h3.before_denoise import (
     MiniMaxH3Ref2VAPrepareLayoutStep, patchify_video_latents)
 from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
@@ -21,6 +20,8 @@ from src.models.sequence_layout import layout_from_indices
 from src.inference.render import KEYFRAME_NOISE_AUG
 from src.models.hybrid_transform import iter_hybrids, set_layout
 
+from . import step_grid
+
 # Rebound per Engine request by sampler_for_canvas.
 LATENT_H, LATENT_W = 48, 84
 
@@ -28,7 +29,7 @@ LATENT_H, LATENT_W = 48, 84
 @torch.no_grad()
 def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, num_steps, seed, device,
                      video_shift=12.0, audio_shift=3.0, runtime=None, step_seconds=None,
-                     conditions=None):
+                     conditions=None, condition_schedule=None, condition_trace=None, timestep_task=None):
     """Preserve the pinned sampler's RNG order and generated-row updates.
 
     Reference visual rows are held at max(video_t, .999) and reference audio
@@ -49,34 +50,39 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
     channels = transformer.config.in_channels                       # 24
     frame_h, frame_w = LATENT_H // patch[1], LATENT_W // patch[2]
 
-    position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, num_audio_condition_rows = (
-        MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
-            text_token_tags, references, condition_latents, audio_conditions, num_latent_frames, LATENT_H, LATENT_W, num_audio_latents,
-            patch, AUDIO_CHANNELS, AUDIO_TAG, VIDEO_TAG,
+    def make_layout(text_token_tags, references, condition_latents, audio_conditions):
+        position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, num_audio_condition_rows = (
+            MiniMaxH3Ref2VAPrepareLayoutStep.build_ref2va_packed_sequence(
+                text_token_tags, references, condition_latents, audio_conditions, num_latent_frames, LATENT_H, LATENT_W, num_audio_latents,
+                patch, AUDIO_CHANNELS, AUDIO_TAG, VIDEO_TAG,
+            )
         )
-    )
-    if torch.device(device).type == 'mps':
-        # RoPE consumes FP32 coordinates; MPS cannot stage the layout's FP64
-        # storage first. Keep the existing CUDA transfer and arithmetic.
-        position_ids = position_ids.float()
-    position_ids, token_tags = position_ids.to(device), token_tags.to(device)
-    video_indices, audio_indices, text_indices = (
-        video_indices.to(device), audio_indices.to(device), text_indices.to(device),
-    )
+        if torch.device(device).type == 'mps':
+            # RoPE consumes FP32 coordinates; MPS cannot stage the layout's FP64
+            # storage first. Keep the existing CUDA transfer and arithmetic.
+            position_ids = position_ids.float()
+        position_ids, token_tags = position_ids.to(device), token_tags.to(device)
+        video_indices, audio_indices, text_indices = (
+            video_indices.to(device), audio_indices.to(device), text_indices.to(device),
+        )
 
-    # A hybrid-converted transformer needs the packed layout before every forward; the
-    # layout is the same at every denoising step, so set it once per generation.
-    if next(iter_hybrids(transformer), None) is not None:
-        # frame_size and text_indices unconditionally: carrying them is free, and only
-        # their consumers are gated (short_conv / text_state).
-        set_layout(transformer, layout_from_indices(
-            video_indices[num_condition_rows:], num_latent_frames, frame_h * frame_w,
-            seq_len=position_ids.shape[0], frame_size=(frame_h, frame_w),
-            text_indices=text_indices,
-        ))
+        if next(iter_hybrids(transformer), None) is not None:
+            # frame_size and text_indices unconditionally: carrying them is free, and only
+            # their consumers are gated (short_conv / text_state).
+            set_layout(transformer, layout_from_indices(
+                video_indices[num_condition_rows:], num_latent_frames, frame_h * frame_w,
+                seq_len=position_ids.shape[0], frame_size=(frame_h, frame_w),
+                text_indices=text_indices,
+            ))
 
-    scheduler = MiniMaxH3Scheduler(shift=video_shift)
-    audio_scheduler = MiniMaxH3Scheduler(shift=audio_shift)
+        return (position_ids, token_tags, video_indices, audio_indices, text_indices,
+                num_condition_rows, num_audio_condition_rows)
+
+    position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, num_audio_condition_rows = (
+        make_layout(text_token_tags, references, condition_latents, audio_conditions))
+
+    scheduler = step_grid.scheduler(shift=video_shift)
+    audio_scheduler = step_grid.scheduler(shift=audio_shift)
     scheduler.set_timesteps(num_steps, device=device)
     audio_scheduler.set_timesteps(num_steps, device=device)
 
@@ -114,15 +120,58 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
         runtime.barrier()
         synchronize()
 
-    seq_len = position_ids.shape[0]
-    for t, audio_t in zip(scheduler.timesteps, audio_scheduler.timesteps):
+    visual_refs = [row for row in refs if row['kind'] in ('image', 'video')]
+    audio_refs = [row for row in refs if row.get('audio_latent') is not None]
+    stages = {row['start_step']: row for row in condition_schedule or []}
+    current_start = 0
+    for step, (t, audio_t) in enumerate(zip(scheduler.timesteps, audio_scheduler.timesteps)):
         step_started = time.perf_counter()
+        if step in stages:
+            stage = stages[step]
+            value = stage['value']
+            # Drop only fixed rows. Never restart a scheduler or draw new noise.
+            generated_video = video_rows[num_condition_rows:]
+            generated_audio = audio_rows[num_audio_condition_rows:]
+            keep_video = [i for i, row in enumerate(visual_refs) if row.get('early_steps', step + 1) > step]
+            keep_audio = [i for i, row in enumerate(audio_refs) if row.get('early_steps', step + 1) > step]
+            references = [SimpleNamespace(kind=row['kind'], has_audio=row.get('audio_latent') is not None)
+                          for row in value.get('references', [])]
+            prompt_embeds = value['prompt_embeds'].to(device=device, dtype=prompt_embeds.dtype)
+            previous_audio_condition_rows = num_audio_condition_rows
+            position_ids, token_tags, video_indices, audio_indices, text_indices, num_condition_rows, num_audio_condition_rows = (
+                make_layout(value['text_token_tags'], references,
+                            [condition_latents[i] for i in keep_video], [audio_conditions[i] for i in keep_audio]))
+            video_rows = torch.cat([condition_rows[i] for i in keep_video] + [generated_video])
+            # A silent proxy does not change the fixed audio prefix. Reuse
+            # its existing packed storage, including the current generated
+            # rows; compact only when reference audio actually disappears.
+            if num_audio_condition_rows != previous_audio_condition_rows:
+                audio_rows = torch.cat([audio_conditions[i] for i in keep_audio] + [generated_audio])
+            if 'refined_text' in stage:
+                transformer._freevideo_refined_text = stage['refined_text'].to(device)
+            if video_rows.shape[0] != video_indices.numel() or audio_rows.shape[0] != audio_indices.numel():
+                raise ValueError('Switched reference rows disagree with packed layout')
+            current_start = step
+        seq_len = position_ids.shape[0]
+        if condition_trace is not None:
+            condition_trace.append(dict(step=step, condition_start_step=current_start,
+                condition=('base' if current_start == max(stages, default=0) else
+                           'full' if current_start == 0 else 'after_' + str(current_start)),
+                reference_video_rows=num_condition_rows, reference_audio_rows=num_audio_condition_rows,
+                text_rows=text_indices.numel(), total_rows=seq_len))
         row_timesteps = torch.full((seq_len,), float(t), dtype=torch.float32, device=device)
         if num_condition_rows:
             row_timesteps[video_indices[:num_condition_rows]] = max(float(t), KEYFRAME_NOISE_AUG)
         row_timesteps[audio_indices[num_audio_condition_rows:]] = float(audio_t)
         row_timesteps[audio_indices[:num_audio_condition_rows]] = 1.0
         timestep, timestep_indices = torch.unique(row_timesteps, sorted=True, return_inverse=True)
+        if timestep_task is not None:
+            from .adaln import modality_timesteps
+            # The cached table covers the initial superset of modalities. Keep
+            # unused clock entries so removing the last visual/audio reference
+            # does not change the table or the remaining rows' clock indices.
+            timestep = modality_timesteps(t[None], audio_t[None], timestep_task)[0]
+            timestep_indices = torch.searchsorted(timestep, row_timesteps)
         noise_pred, audio_noise_pred = transformer(
             hidden_states=video_rows[None],
             audio_hidden_states=audio_rows[None],

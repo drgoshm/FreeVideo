@@ -1,0 +1,196 @@
+"""Coarse frame previews of the video being sampled.
+
+At each step the scheduler already holds the model's prediction of the clean
+latents. A fixed per-pixel affine map from the 24 latent channels to RGB turns
+four of those latent frames into a small picture without running the VAE. The
+observer only reads tensors the sampler already produced and never writes to
+them, so the sampled latents are identical with it on or off. Any failure
+silently turns it off for the rest of the request.
+"""
+from contextlib import contextmanager
+import json
+import os
+from pathlib import Path
+
+WEIGHTS = Path(__file__).with_name('frame_preview_weights.json')
+FILE = 'frame-preview.jpg'
+MARKER = 'frame-preview-off'
+ENV = 'FREEVIDEO_FRAME_PREVIEW'
+FIRST_STEP = 3
+FRAMES = 4
+QUALITY = 82
+MAX_FRAME_WIDTH = 336
+CHANNELS = 24
+ROW_WIDTH = CHANNELS * 4  # 24 channels x a (1, 2, 2) patch
+
+_sink = None
+_active = None
+_weights = None
+_marker = None  # request-level file: a failure in one process keeps the request's later processes off
+_failed = False  # request-level: one failure turns previews off for every later pass
+_serial = 0      # request-level: numbers pictures across passes so the page never mistakes a new one for the old
+
+
+def disabled(environ=None):
+    value = (os.environ if environ is None else environ).get(ENV, '')
+    return value.strip().lower() in ('0', 'off', 'false', 'no')
+
+
+def load_weights(path=WEIGHTS):
+    """(k, weight[24, 3k^2], bias[3k^2]) as lists; ValueError when malformed."""
+    value = json.loads(Path(path).read_text(encoding='utf-8'))
+    k, weight, bias = value['k'], value['weight'], value['bias']
+    outputs = 3 * k * k
+    if (value.get('version') != 1 or type(k) is not int or not 1 <= k <= 8 or value.get('channels') != CHANNELS
+            or len(weight) != CHANNELS or any(len(row) != outputs for row in weight) or len(bias) != outputs):
+        raise ValueError('Unsupported frame preview weights')
+    return k, weight, bias
+
+
+def configure(directory, emit=None, *, weights=None, request_state=None):
+    """Turn previews on for this process; returns whether they are active.
+
+    `directory` receives the picture; `emit(event)` reports each new one.
+    `request_state` is a per-request directory shared by the request's worker
+    processes: a failure leaves a marker there, so a later process of the same
+    request stays off.
+    """
+    global _sink, _weights, _failed, _serial, _marker
+    _sink = _weights = None
+    _failed, _serial = False, 0
+    _marker = None if request_state is None else Path(request_state) / MARKER
+    if disabled():
+        return False
+    if _marker is not None and _marker.exists():
+        _failed = True
+        return False
+    try:
+        k, weight, bias = load_weights(WEIGHTS if weights is None else weights)
+        if emit is None:
+            from .sampling_progress import emit_event as emit
+        _weights = (k, weight, bias)
+        _sink = (Path(directory), emit)
+    except Exception:
+        _sink = _weights = None
+    return _sink is not None
+
+
+def _remove(directory):
+    for name in (FILE, FILE + '.tmp'):
+        try:
+            (directory / name).unlink()
+        except OSError:
+            pass
+
+
+def clear():
+    """Forget the sink and remove the last picture."""
+    global _sink, _weights
+    sink, _sink, _weights = _sink, None, None
+    if sink is not None:
+        _remove(sink[0])
+
+
+def _fail():
+    """Previews stay off for the rest of the request: drop the picture and tell the page to do the same."""
+    global _sink, _weights, _failed
+    sink, _sink, _weights, _failed = _sink, None, None, True
+    if _marker is not None:
+        try:
+            _marker.write_text('off\n', encoding='ascii')
+        except OSError:
+            pass
+    if sink is None:
+        return
+    _remove(sink[0])
+    try:
+        sink[1](dict(event='frame_preview_clear'))
+    except Exception:
+        pass
+
+
+class _Preview:
+    def __init__(self, latent_frames, frame_h, frame_w, step_offset, total):
+        self.rows = latent_frames * frame_h * frame_w
+        self.shape = (latent_frames, frame_h, frame_w)
+        self.step_offset, self.total = step_offset, total
+        self.calls = 0
+        count = min(FRAMES, latent_frames)
+        self.indices = sorted({round(i * (latent_frames - 1) / max(1, count - 1)) for i in range(count)})
+        self.tensors = None
+
+    def render(self, model_output, timestep, sample):
+        """The preview strip as uint8 (height, frames * width, 3), from the predicted clean latents."""
+        import torch
+        k, weight, bias = _weights
+        t, fh, fw = self.shape
+        if self.tensors is None or self.tensors[0].device != sample.device:
+            self.tensors = (torch.tensor(weight, dtype=torch.float32, device=sample.device),
+                            torch.tensor(bias, dtype=torch.float32, device=sample.device))
+        matrix, offset = self.tensors
+        index = torch.tensor(self.indices, device=sample.device)
+        with torch.no_grad():
+            seen = sample.detach().reshape(t, fh, fw, ROW_WIDTH)[index].float()
+            velocity = model_output.detach().reshape(t, fh, fw, ROW_WIDTH)[index].float()
+            x0 = seen + (1. - float(timestep)) * velocity
+            n = len(self.indices)
+            # (n, fh, fw, C, 1, 2, 2) -> (n, fh*2, fw*2, C)
+            x0 = x0.reshape(n, fh, fw, CHANNELS, 2, 2).permute(0, 1, 4, 2, 5, 3).reshape(n, fh * 2, fw * 2, CHANNELS)
+            out = torch.addmm(offset, x0.reshape(-1, CHANNELS), matrix)
+            out = out.reshape(n, fh * 2, fw * 2, 3, k, k).permute(0, 3, 1, 4, 2, 5)
+            out = out.reshape(n, 3, fh * 2 * k, fw * 2 * k)
+            if out.shape[-1] > MAX_FRAME_WIDTH:
+                size = (max(1, round(out.shape[-2] * MAX_FRAME_WIDTH / out.shape[-1])), MAX_FRAME_WIDTH)
+                out = torch.nn.functional.interpolate(out, size=size, mode='area')
+            picture = out.clamp(0., 1.).mul(255.).round().to(torch.uint8)
+            return picture.permute(2, 0, 3, 1).reshape(picture.shape[2], n * picture.shape[3], 3).cpu().numpy()
+
+    def observe(self, model_output, timestep, sample):
+        global _serial
+        if sample.ndim != 2 or tuple(sample.shape) != (self.rows, ROW_WIDTH):
+            return
+        self.calls += 1
+        step = self.step_offset + self.calls
+        if step < FIRST_STEP:
+            return
+        from PIL import Image
+        directory, emit = _sink
+        strip = self.render(model_output, timestep, sample)
+        target = directory / FILE
+        temporary = directory / (FILE + '.tmp')
+        Image.fromarray(strip).save(temporary, 'JPEG', quality=QUALITY)
+        os.replace(temporary, target)
+        # Never repeats within a request, also when the second pass runs in another process.
+        _serial = max(_serial + 1, step)
+        n = len(self.indices)
+        emit(dict(event='frame_preview', step=step, total=self.total, serial=_serial, frames=n,
+                  frame_width=strip.shape[1] // n, frame_height=strip.shape[0]))
+
+
+@contextmanager
+def observing(*, latent_frames, frame_h, frame_w, step_offset=0, total=None):
+    """Observe the video scheduler of one sampling pass; no-op unless configured."""
+    global _active
+    previous = _active
+    _active = None
+    if _sink is not None and not _failed:
+        try:
+            _active = _Preview(latent_frames, frame_h, frame_w, step_offset, total)
+        except Exception:
+            _active = None
+            _fail()
+    try:
+        yield
+    finally:
+        _active = previous
+
+
+def observe(model_output, timestep, sample):
+    """Called by the scheduler before its step; never raises, never changes tensors."""
+    active = _active
+    if active is None or _sink is None:
+        return
+    try:
+        active.observe(model_output, timestep, sample)
+    except Exception:
+        _fail()

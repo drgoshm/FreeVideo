@@ -24,7 +24,7 @@ SAMPLE_FIELDS = ('config', 'sample_seconds', 'step_seconds', 'finite_latents', '
     'attention_backend_calls', 'head_execution', 'text_refinement', 'sampling_memory',
     'load_seconds', 'load_breakdown', 'load_peak_allocated_bytes', 'load_peak_reserved_bytes',
     'torch_peak_allocated_bytes', 'torch_peak_reserved_bytes', 'latent_save_seconds', 'sample_metrics_scope',
-    'sampling_plan', 'sampling_passes', 'latent_upscale', 'refinement', 'fp8_kernel_calls')
+    'sampling_plan', 'sampling_passes', 'latent_upscale', 'refinement', 'fp8_kernel_calls', 'continuation', 'audio_context')
 
 
 def completed_sampling(metrics):
@@ -71,6 +71,48 @@ def _digest(path):
     return digest.hexdigest()
 
 
+def _plan_without_staged(plan):
+    return {k: v for k, v in plan.items() if k != 'staged'} if isinstance(plan, dict) else plan
+
+
+def _canvas_without_staged(canvas):
+    if isinstance(canvas, dict) and isinstance(canvas.get('sampling_plan'), dict):
+        return dict(canvas, sampling_plan=_plan_without_staged(canvas['sampling_plan']))
+    return canvas
+
+
+def _without_staged(value):
+    """A copy of `value` whose sampling plan lacks `staged` in its two stored places.
+
+    The controller keeps the plan twice: as `sampling_plan` and inside the
+    canvas (`geometry`), and the canvas is also part of the saved identity.
+    Nothing else is normalised.
+    """
+    if not isinstance(value, dict):
+        return value
+    result = dict(value)
+    if 'sampling_plan' in result:
+        result['sampling_plan'] = _plan_without_staged(result['sampling_plan'])
+    if 'geometry' in result:
+        result['geometry'] = _canvas_without_staged(result['geometry'])
+    return result
+
+
+def same_identity(left, right):
+    """Equal sampling identities, ignoring the plan's `staged` marker.
+
+    A plan made before the marker existed (a 20-step preview of a large canvas
+    kept in the previous version) differs from today's plan of the same request
+    only by that key; every field that decides the math is still compared.
+    """
+    return _without_staged(left) == _without_staged(right)
+
+
+def same_canvas(saved, canvas):
+    """The saved canvas equals the request's, ignoring the plan's `staged` marker."""
+    return _canvas_without_staged(saved) == _canvas_without_staged(canvas)
+
+
 def sampling_provenance(request):
     """Bind the result to the exact conditioning, model manifest and math."""
     from .paths import base_path
@@ -94,10 +136,24 @@ def sampling_provenance(request):
             result['upscaler_sha256'] = _digest(request['upscaler_checkpoint'])
             if result['upscaler_sha256'] != request['sampling_plan']['upscaler_sha256']:
                 raise ValueError('Latent upscaler differs from the planned checkpoint')
+    if request.get('hide_tail_frames'):
+        result['hide_tail_frames'] = request['hide_tail_frames']
+    if request.get('continuation') is not None:
+        # A retry's identity binds the accepted bytes, without embedding the
+        # snapshot again or making a relocation change computation identity.
+        value = request['continuation']
+        tail = value.get('tail')
+        if isinstance(tail, dict) and Path(tail.get('snapshot') or '.').is_file():
+            # The request as it was sent asks for the ending to be encoded; the worker goes on with the
+            # record it wrote. A retry compares the two, so both are named by that record.
+            value = dict({key: item for key, item in value.items() if key != 'tail'},
+                         snapshot_sha256=_digest(tail['snapshot']), source_id=tail['source_id'])
+        result['continuation'] = {key: item for key, item in value.items()
+                                  if key not in ('snapshot', 'snapshot_data', 'source_video')}
     return result
 
 
-def load_saved_sampling(request, torch):
+def load_saved_sampling(request, torch, *, continuation_tail_callback=None):
     """Load verified CPU tensors; caller controls CUDA admission and transfer."""
     resume = request['resume_decode']
     if not isinstance(resume, dict) or any(not isinstance(resume.get(key), str) or not resume[key]
@@ -113,14 +169,15 @@ def load_saved_sampling(request, torch):
     if not completed_sampling(previous):
         raise ValueError('Decoder retry requires all planned finite sampling steps')
     provenance = sampling_provenance(request)
-    if provenance != sampling_provenance(prior) or provenance != previous.get('sampling_provenance'):
+    if (not same_identity(provenance, sampling_provenance(prior))
+            or not same_identity(provenance, previous.get('sampling_provenance'))):
         raise ValueError('Retained sampling does not match this request and its current inputs')
     canvas = request['geometry']
     if any(previous.get('geometry', {}).get(key) != canvas[key] for key in ('width', 'height', 'frames', 'fps')):
         raise ValueError('Retained sampling geometry differs from the request')
     value = torch.load(str(paths['latents']), map_location='cpu', weights_only=True)
     if (not isinstance(value, dict) or type(value.get('seed')) is not int or value['seed'] != request['seed']
-            or value.get('geometry') != canvas or value.get('sampling_provenance') != provenance):
+            or not same_canvas(value.get('geometry'), canvas) or not same_identity(value.get('sampling_provenance'), provenance)):
         raise ValueError('Retained latent provenance differs from the sampling receipt')
     width, height, frames, fps = (canvas[key] for key in ('width', 'height', 'frames', 'fps'))
     if (any(type(n) is not int or n <= 0 for n in (width, height, frames, fps))
@@ -146,6 +203,8 @@ def load_saved_sampling(request, torch):
         sampling_source_metrics=copy.deepcopy(source), load_seconds=0.,
         sampling_metrics_scope='Reused completed sampling; sampling times and peaks belong to the source attempt.',
         work_seconds_scope='Current decoder retry, including retained latent validation and transfer only.')
+    if continuation_tail_callback is not None:
+        continuation_tail_callback(value.get('continuation_tail'))
     return value['video'], value['audio'], metrics, Path(provenance['base'])
 
 
@@ -232,12 +291,13 @@ def load_first_pass(request, torch):
     if not isinstance(prior, dict) or not first_pass_complete(previous):
         raise ValueError('Upscaling requires a finished preview')
     provenance = refine_provenance(request)
-    if provenance != refine_provenance(prior) or provenance != previous['refine_provenance']:
+    if (not same_identity(provenance, refine_provenance(prior))
+            or not same_identity(provenance, previous['refine_provenance'])):
         raise ValueError('The preview does not match this request and its current inputs')
     canvas, first = request['geometry'], request['sampling_plan']['first']
     value = torch.load(str(paths['input']), map_location='cpu', weights_only=True)
     if (not isinstance(value, dict) or type(value.get('seed')) is not int or value['seed'] != request['seed']
-            or value.get('geometry') != canvas or value.get('refine_provenance') != provenance):
+            or not same_canvas(value.get('geometry'), canvas) or not same_identity(value.get('refine_provenance'), provenance)):
         raise ValueError('Preview first-pass provenance differs from its receipt')
     width, height, frames, fps = first['width'], first['height'], first['frames'], canvas['fps']
     if (any(type(n) is not int or n <= 0 for n in (width, height, frames, fps))
@@ -279,7 +339,7 @@ def refine_checkpoint_complete(metrics):
             and all(type(value) in (int, float) and math.isfinite(value) and value >= 0 for value in seconds))
 
 
-def load_refine_input(request, torch):
+def load_refine_input(request, torch, *, continuation_tail_callback=None):
     """Load a verified retained first pass on the CPU; the caller moves it to the GPU."""
     resume = request['resume_refine']
     if not isinstance(resume, dict) or any(not isinstance(resume.get(key), str) or not resume[key]
@@ -293,12 +353,13 @@ def load_refine_input(request, torch):
     if not isinstance(prior, dict) or not refine_checkpoint_complete(previous):
         raise ValueError('First-pass retry requires a complete retained first pass')
     provenance = refine_provenance(request)
-    if provenance != refine_provenance(prior) or provenance != previous['refine_provenance']:
+    if (not same_identity(provenance, refine_provenance(prior))
+            or not same_identity(provenance, previous['refine_provenance'])):
         raise ValueError('Retained first pass does not match this request and its current inputs')
     canvas = request['geometry']
     value = torch.load(str(paths['input']), map_location='cpu', weights_only=True)
     if (not isinstance(value, dict) or type(value.get('seed')) is not int or value['seed'] != request['seed']
-            or value.get('geometry') != canvas or value.get('refine_provenance') != provenance):
+            or not same_canvas(value.get('geometry'), canvas) or not same_identity(value.get('refine_provenance'), provenance)):
         raise ValueError('Retained first-pass provenance differs from its receipt')
     width, height, frames, fps = (canvas[key] for key in ('width', 'height', 'frames', 'fps'))
     if (any(type(n) is not int or n <= 0 for n in (width, height, frames, fps))
@@ -320,4 +381,6 @@ def load_refine_input(request, torch):
                    first_pass_source_attempt=previous.get('refine_source_attempt', prior.get('resource_attempt')),
                    first_pass_scope='Reused the retained first pass, latent upscale and crop; their times and '
                                     'peaks belong to the source attempt.')
+    if continuation_tail_callback is not None:
+        continuation_tail_callback(value.get('continuation_first'))
     return value['video'], value['audio'], first, lifted, receipt

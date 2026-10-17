@@ -2,20 +2,98 @@
 import json
 import logging
 import os
+import sys
 import time
 from pathlib import Path
 
 
 def page_report(value):
-    """The browser page's own check, bounded; None for anything else."""
-    if not isinstance(value, dict) or value.get('state') not in ('ready', 'error'):
+    """The browser page's own check, bounded; None for anything else.
+
+    'loading' arrives as soon as FreeVideo's page script starts, before its
+    check ends with 'ready' or 'error'.
+    """
+    if not isinstance(value, dict) or value.get('state') not in ('loading', 'ready', 'error'):
         return None
     rows = lambda key, count, limit: ([p[:limit] for p in value[key][:count] if isinstance(p, str)]
                                       if isinstance(value.get(key), list) else [])
     text = lambda key, limit: value.get(key)[:limit] if isinstance(value.get(key), str) else ''
     return dict(state=value['state'], problems=rows('problems', 8, 500), errors=rows('errors', 40, 300),
                 ready=value.get('ready') is True, launch=value.get('launch') is True, view=text('view', 20),
-                agent=text('agent', 300), frontend=text('frontend', 40), page=text('page', 200), at=time.time())
+                agent=text('agent', 300), frontend=text('frontend', 40), page=text('page', 200),
+                client=text('client', 80), at=time.time())
+
+
+PAGE_SCRIPTS_MISSING = (
+    'FreeVideo’s page scripts have not run in this browser, so the creative workspace is missing. '
+    'Press Ctrl+F5 to reload the page. If it stays missing, open the FreeVideo launcher, '
+    'click Settings › Repair, and open FreeVideo again. '
+    '浏览器没有运行 FreeVideo 的页面脚本，所以看不到创作面板。请按 Ctrl+F5 强制刷新页面；'
+    '仍然没有时，请在 FreeVideo 启动器的“设置”里点击“修复”，然后重新打开 FreeVideo。')
+# Without the launcher, the page's own Settings cannot open either.
+PAGE_SCRIPTS_MISSING_NODE = (
+    'FreeVideo’s page scripts have not run in this browser, so the creative workspace is missing. '
+    'Press Ctrl+F5 to reload the page. If it stays missing, update the FreeVideo node and restart ComfyUI. '
+    '浏览器没有运行 FreeVideo 的页面脚本，所以看不到创作面板。请按 Ctrl+F5 强制刷新页面；'
+    '仍然没有时，请更新 FreeVideo 节点并重启 ComfyUI。')
+
+# Where a node message sends the user to repair. The launcher has its own
+# Repair; a ComfyUI started without it has the page's Settings › Install / repair.
+LAUNCHER_REPAIR = 'In the FreeVideo launcher, open Settings and click Repair.'
+PAGE_REPAIR = 'Open FreeVideo Settings in ComfyUI and click "Install / repair".'
+# The launcher reads /freevideo/launcher/ui every 3 s while this ComfyUI is open.
+LAUNCHER_SEEN = 30
+
+
+def launcher_watching(server, now=None):
+    """True while a FreeVideo launcher is reading this server's page check."""
+    seen = getattr(server, '_freevideo_launcher_seen', None)
+    now = time.monotonic() if now is None else now
+    return isinstance(seen, float) and 0 <= now - seen < LAUNCHER_SEEN
+
+
+def repair_hint(server=None):
+    """The repair sentence for messages shown in this ComfyUI."""
+    server = comfy_server() if server is None else server
+    return LAUNCHER_REPAIR if launcher_watching(server) else PAGE_REPAIR
+
+
+def comfy_server():
+    """ComfyUI's PromptServer when this process is ComfyUI; its module is never imported here."""
+    module = sys.modules.get('server')
+    return getattr(getattr(module, 'PromptServer', None), 'instance', None)
+
+
+def request_repair(text, server=None):
+    """Ask the launcher reading this server for its Repair card, until ComfyUI restarts."""
+    server = comfy_server() if server is None else server
+    if server is not None and text:
+        server._freevideo_repair = dict(kind='runtime-libraries', text=str(text)[:2000], at=time.time())
+
+
+def launcher_view(page, server, now=None):
+    """What the launcher reads: the page check and any repair a failed run asked for."""
+    server._freevideo_launcher_seen = time.monotonic() if now is None else now
+    value = dict(page)
+    repair = getattr(server, '_freevideo_repair', None)
+    if isinstance(repair, dict):
+        value['repair'] = repair
+    return value
+
+
+def page_notice(server):
+    """Text for the generating node when no FreeVideo page has reported to this ComfyUI.
+
+    The page check names its problems on the page, but it is itself one of
+    FreeVideo's page scripts. When none of them runs, the nodes still generate
+    and nothing on the page says the workspace is missing; ComfyUI's own node
+    text is then the only place left to say so.
+    """
+    if server is None or getattr(server, '_freevideo_launcher', None) is None:
+        return ''
+    if getattr(server, '_freevideo_page_reported', None):
+        return ''
+    return PAGE_SCRIPTS_MISSING if launcher_watching(server) else PAGE_SCRIPTS_MISSING_NODE
 
 
 def save_page_report(engine_root, report):
@@ -45,6 +123,8 @@ def register():
     root = Path(folder_paths.__file__).resolve().parent
     info = dict(protocol=1, source=str(source), engine_root=str(installation_root(source)),
                 comfy_root=str(root), data_root=str(Path(folder_paths.base_path).resolve()))
+    from comfy.cli_args import args
+    info['listen'] = args.listen
     from .comfy_console import install
     try:
         info['console_log'] = str(install(info['engine_root']))
@@ -72,9 +152,10 @@ def register():
         except ValueError:
             report = None
         if report is None:
-            return web.json_response(dict(error='Expected {"state": "ready" | "error", "problems": [...]}'), status=400)
+            return web.json_response(dict(error='Expected {"state": "loading" | "ready" | "error", "problems": [...]}'), status=400)
         report['source'] = info['source']
         page.clear(); page.update(report)
+        server._freevideo_page_reported = report['at']
         try:
             save_page_report(info['engine_root'], report)
         except OSError as error:
@@ -86,4 +167,4 @@ def register():
 
     @server.routes.get('/freevideo/launcher/ui')
     async def page_state(request):
-        return web.json_response(page)
+        return web.json_response(launcher_view(page, server))

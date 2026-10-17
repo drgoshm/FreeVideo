@@ -111,6 +111,9 @@ def nonlocal_readout_bytes(canvas, attention_width, text_rows=1024):
     canvas = canvas or {}
     video = canvas.get('video_tokens', 72576)
     rows = video + text_rows + canvas.get('reference_video_tokens', 0) + canvas.get('reference_audio_tokens', 0)
+    if canvas.get('early_reference') is not None:
+        from .two_pass import placement_tokens
+        rows = placement_tokens(canvas) + text_rows
     return int(1.25 * (rows + video) * attention_width * 2)
 
 

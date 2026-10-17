@@ -1,0 +1,28 @@
+.fv-ed-export-dialog{box-sizing:border-box;position:fixed;inset:0;margin:auto;width:480px;max-width:calc(100vw - 32px);height:fit-content;max-height:calc(100dvh - 32px);overflow:auto;padding:24px;border:1px solid var(--fv-border);border-radius:var(--fv-r-lg);background:var(--fv-card);color:var(--fv-ink);font:13px/1.6 var(--fv-font);box-shadow:0 24px 80px #0006}
+.fv-ed-export-dialog::backdrop{background:#070a0db8}
+.fv-ed-export-dialog h2{margin:0 0 24px;font-size:20px;line-height:1.4;font-weight:600}
+.fv-ed-export-rows{display:flex;flex-direction:column;gap:16px}
+.fv-ed-export-row{display:grid;grid-template-columns:68px minmax(0,1fr);align-items:center;gap:12px;min-width:0}
+.fv-ed-export-label{color:var(--fv-muted)}
+.fv-ed-export-format{display:block;grid-column:2}
+.fv-ed-export-segments{display:flex;min-width:0;padding:3px;gap:2px;border:1px solid var(--fv-border);border-radius:10px;background:var(--fv-bg)}
+.fv-ed-export-dialog .fv-ed-export-segments button{flex:1;min-width:0;height:auto;min-height:28px;padding:4px 5px;border:0;border-radius:7px;background:transparent;color:var(--fv-muted);font-size:12px;line-height:1.4;white-space:normal;overflow-wrap:normal}
+.fv-ed-export-dialog .fv-ed-export-segments button[aria-pressed=true]{background:var(--fv-raised);color:var(--fv-ink);font-weight:600}
+.fv-ed-export-dialog .fv-ed-export-segments button:hover:not(:disabled){background:var(--fv-hover)}
+.fv-ed-export-notices{border-top:1px solid var(--fv-border);padding-top:20px;margin-top:24px;font-size:12px}
+.fv-ed-export-notices p{margin:0}
+.fv-ed-export-crop{color:var(--fv-warning)}
+.fv-ed-export-gap,.fv-ed-export-pending{color:var(--fv-muted)}
+.fv-ed-export-links{display:flex;flex-wrap:wrap;gap:16px;margin:8px 0}
+.fv-ed-export-dialog .fv-ed-export-links button{height:auto;min-height:24px;padding:0;border:0;background:transparent;color:var(--fv-accent);font-size:12px}
+.fv-ed-export-footer{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-top:24px}
+.fv-ed-export-summary{color:var(--fv-muted);font-size:12px;font-variant-numeric:tabular-nums}
+.fv-ed-export-buttons{display:flex;gap:8px;margin-left:auto}
+.fv-ed-export-dialog .fv-ed-export-buttons button{padding:7px 14px}
+@media(max-width:520px){
+ .fv-ed-export-dialog{padding:20px}
+ .fv-ed-export-row{grid-template-columns:1fr;gap:6px}
+ .fv-ed-export-format{grid-column:1}
+ .fv-ed-export-rows{gap:12px}
+ .fv-ed-export-dialog .fv-ed-export-segments button{min-height:32px}
+}

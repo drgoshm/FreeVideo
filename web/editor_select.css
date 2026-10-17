@@ -1,0 +1,15 @@
+/* Individual outlines make non-contiguous selections visible on every track. */
+.fv-ed-track-view .fv-ed-clip[aria-selected=true]{outline:2px solid var(--fv-accent);outline-offset:-2px}
+.fv-ed-track-view[data-multiselect=true] .fv-ed-selection:not(.fv-ed-range):not(.fv-ed-gap){display:none}
+.fv-ed-marquee{position:absolute;z-index:8;border:1px solid var(--fv-accent);background:color-mix(in srgb,var(--fv-accent) 12%,transparent);pointer-events:none}
+.fv-ed-marquee-outlines{position:absolute;inset:0;z-index:8;pointer-events:none}
+.fv-ed-marquee-item{position:absolute;border:2px solid var(--fv-accent);border-radius:8px}
+.fv-ed-group-guide{position:absolute;top:24px;bottom:0;width:1px;background:var(--fv-accent);z-index:8;pointer-events:none}
+.fv-ed-group-label{position:absolute;z-index:10;padding:4px 7px;background:var(--fv-card);color:var(--fv-ink);border:1px solid var(--fv-border);border-radius:6px;font-size:12px;white-space:nowrap;pointer-events:none}
+.fv-ed-group-layer{position:absolute;inset:0;z-index:7;opacity:.85;pointer-events:none;will-change:transform}
+.fv-ed-group-layer .fv-ed-clip{pointer-events:auto;cursor:grabbing}
+.fv-ed-track-view .fv-ed-cannot-drop{cursor:not-allowed}
+.fv-ed-track-view .fv-ed-cannot-drop::after{content:"";position:absolute;inset:0;border:2px solid var(--fv-danger);border-radius:inherit;pointer-events:none;z-index:5;background:repeating-linear-gradient(135deg,transparent 0 6px,color-mix(in srgb,var(--fv-danger) 28%,transparent) 6px 9px)}
+.fv-ed-track-view[data-select-gesture=box] .fv-ed-selection{display:none}
+.fv-ed-track-view[data-select-blocked=true] .fv-ed-group-label{color:var(--fv-warning);border-color:var(--fv-warning)}
+@media(forced-colors:active){.fv-ed-marquee{border-color:Highlight}.fv-ed-clip[aria-selected=true]{outline-color:Highlight}.fv-ed-cannot-drop::after{border-style:dashed!important}}

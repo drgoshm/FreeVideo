@@ -1,26 +1,24 @@
 """Small native compatibility controls shared by the EXE and portable launcher."""
 from pathlib import Path
 
+from .long_paths import io_path, plain_text, plain_errors
 from .compatibility import Store, installed_identity, check_installation, LEVELS
 
 
+@plain_errors
 def notify(window, root, zh=True):
     from tkinter import messagebox
     root = Path(root)
-    if not (root/'machine.json').is_file():
+    if not (io_path(root)/'machine.json').is_file():
         return
     try:
         value = check_installation(root)
         if value.get('notice'):
-            level = value['level']
-            messagebox.showinfo('FreeVideo',
-                ('上次生成未正常结束，已自动开启兼容性设置（第 %d 档）。\n'
-                 '可在“兼容性设置”中调节或关闭。分辨率、时长和步数保持不变。' % level) if zh else
-                ('The previous generation ended unexpectedly. Compatibility level %d is now enabled.\n'
-                 'You can adjust or disable it in Compatibility settings. Resolution, duration and steps are unchanged.' % level), parent=window)
+            from .compatibility_copy import notice_text
+            messagebox.showinfo('FreeVideo', notice_text(value, zh), parent=window)
             Store(root).acknowledge(installed_identity(root), value['notice']['id'])
     except Exception as error:
-        messagebox.showerror('FreeVideo', str(error), parent=window)
+        messagebox.showerror('FreeVideo', plain_text(error), parent=window)
 
 
 def open_settings(window, root, zh=True):
@@ -59,14 +57,12 @@ def open_settings(window, root, zh=True):
         level.set(round(level.get())); changed()
         if int(level.get()) == 0: automatic.set(False)
     scale.bind('<ButtonRelease-1>', released)
-    ttk.Checkbutton(body, variable=automatic, text='异常中断后自动启用／提高兼容档' if zh else
-                    'Enable / increase compatibility after an unexpected interruption').pack(anchor='w')
-    ttk.Label(body, text=('仅调整分块和预取，可能降低速度并产生浮点差异。\n'
-        '不改变分辨率、时长、步数或 attention 后端。\n'
-        '不能保证避免设备故障；设置从下一次生成生效。') if zh else
-        ('Adjusts grouping and prefetch; may reduce speed and change floating-point results.\n'
-         'Keeps resolution, duration, steps and attention.\n'
-         'Cannot guarantee hardware stability. Applies to the next generation.'),
+    ttk.Checkbutton(body, variable=automatic, text='异常中断后自动提高兼容档位' if zh else
+                    'Raise the level automatically after an unexpected interruption').pack(anchor='w')
+    ttk.Label(body, text='从下一次生成起生效。档位越高，显卡每次处理的数据越少，生成越慢，画面也会有细微差别；'
+        '分辨率、时长和步数不变。' if zh else
+        'Applies from the next generation. Higher levels have the GPU handle less at a time, so generation is slower '
+        'and the picture differs slightly; resolution, duration and steps stay the same.',
         style='Muted.TLabel', wraplength=460).pack(fill='x', pady=16)
     def save():
         try:

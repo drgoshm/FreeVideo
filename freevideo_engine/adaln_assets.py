@@ -11,6 +11,8 @@ from pathlib import Path, PurePosixPath
 import re
 import shutil
 import struct
+import time
+from . import disk_space
 
 CONTRACT = 'minimax-h3-adaln-silu-linear-3x6-v1'
 FORMAT = 'freevideo-adaln-v2'
@@ -208,7 +210,7 @@ def download_table(root, table, index):
             raise ValueError('Missing locally computed AdaLN table; original receipt retained: ' + str(path))
     remaining = sum(r['bytes'] for r in table['files'] if
                     not asset_path(root, '%02d.safetensors' % r['index']).is_file())
-    if shutil.disk_usage(root).free < remaining + 64 * 1024**2:
+    if disk_space.free_bytes(root) < remaining + 64 * 1024**2:
         raise ValueError('Not enough disk space to prepare this sampling preset. Existing files retained.')
     plan = _download_plan()
     remote = table['download']
@@ -257,7 +259,7 @@ def restore_projections(cache, manifest):
         raise ValueError('This schedule/LoRA needs original AdaLN weights. Reuse a full prepared cache; '
                          'the slim package has no pinned recovery source.')
     needed = sum(r['bytes'] for r in missing)
-    if shutil.disk_usage(cache).free < needed + 1024**3:
+    if disk_space.free_bytes(cache) < needed + 1024**3:
         raise ValueError('This schedule/LoRA needs %.2f GiB of optional AdaLN weights; '
                          'insufficient disk space. Existing model and request retained.' % (needed / 1024**3))
     print(json.dumps({'event': 'adaln_sources_required', 'bytes': needed,
@@ -267,9 +269,23 @@ def restore_projections(cache, manifest):
     plan = _download_plan()
     prefix = remote.get('prefix', 'cache')
     asset_path(cache, prefix)  # Validate before constructing a remote URL.
+    # These files take minutes: give the page byte progress, at most once a
+    # second and at every file boundary.
+    shown = [0.]
+    def report(done, speed, force=False):
+        now = time.monotonic()
+        if force or now - shown[0] >= 1:
+            shown[0] = now
+            print(json.dumps(dict(event='adaln_sources_download', done_bytes=done, total_bytes=needed,
+                                  bytes_per_second=speed)), flush=True)
+    before = 0
+    report(0, 0., True)
     for row in missing:
         source = dict(repo=remote['repo'], revision=remote['revision'], file=prefix+'/'+row['file'])
         network.download(network.model_urls(plan, source), asset_path(cache, row['file']), row['sha256'],
+                         lambda done, size, speed, **_: report(before + min(done, row['bytes']), speed),
                          size=row['bytes'], headers_for=model_headers, network=plan, category='models',
                          stall_seconds=30, slow_seconds=15, low_speed_limit=64 * 1024)
+        before += row['bytes']
+        report(before, 0., True)
     return rows

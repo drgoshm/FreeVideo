@@ -1,5 +1,8 @@
-.fv-prompt-editor{position:relative}.fv-studio .fv-prompt-editor textarea{padding-bottom:40px}
-.fv-studio .fv-reference-trigger{position:absolute;right:9px;bottom:9px;min-height:27px;width:30px;padding:0;font-size:17px;border:0;background:var(--fv-raised);color:var(--fv-muted)}
+.fv-prompt-editor{position:relative;display:flex;flex-direction:column;height:170px;min-height:148px;max-height:340px;resize:vertical;overflow:hidden;background:var(--fv-card)}
+.fv-studio .fv-prompt-editor textarea{flex:1;min-height:0;height:0;max-height:none;resize:none;padding-bottom:8px;outline:none}
+.fv-prompt-tools{display:flex;flex:none;align-items:center;justify-content:flex-end;height:36px;padding-right:9px}
+.fv-studio .fv-reference-trigger{min-height:27px;height:27px;width:30px;padding:0;font-size:17px;border:0;background:var(--fv-raised);color:var(--fv-muted)}
+@media(min-height:960px) and (min-width:681px){.fv-prompt-editor{height:clamp(170px,24dvh,340px)}}
 .fv-reference-picker{box-sizing:border-box;position:fixed;inset:auto;margin:0;padding:6px;border:1px solid var(--fv-border,#3a414c);border-radius:14px;background:var(--fv-card,#1a202a);color:var(--fv-ink,#eee);box-shadow:0 14px 42px #0006;font:13px/1.4 var(--fv-font,system-ui);z-index:10000;max-height:280px;overflow:hidden;animation:fv-reference-appear .12s ease-out}
 .fv-reference-picker[hidden]{display:none!important}.fv-reference-options{max-height:266px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin}
 .fv-reference-option{display:flex;align-items:center;gap:10px;min-height:59px;padding:7px;border-radius:9px;cursor:pointer}
@@ -10,3 +13,16 @@
 .fv-reference-empty{padding:18px 12px;color:var(--fv-muted,#a9b3c4)}.fv-reference-picker button{margin:0 12px 10px;padding:5px 10px;border:1px solid var(--fv-border,#3a414c);border-radius:8px;background:var(--fv-raised,#252e39);color:inherit;cursor:pointer;font:inherit}
 @keyframes fv-reference-appear{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
 @media(prefers-reduced-motion:reduce){.fv-reference-picker{animation:none}}
+.fv-term-picker .fv-reference-options{max-height:220px}
+.fv-term-option{min-height:34px;padding:5px 10px}
+.fv-term-option strong{flex:none;font-size:13px}
+
+.fv-reference-group{padding:6px 8px 3px;font-size:11px;color:var(--fv-muted,#a9b3c4)}
+.fv-reference-person{min-height:36px;padding:5px 8px;gap:10px}
+.fv-reference-face{width:24px;height:24px;flex:none;border-radius:50%;object-fit:cover;background:var(--fv-raised,#252e39)}
+.fv-reference-person strong{font-size:13px;font-weight:550;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fv-reference-person[aria-disabled=true]{opacity:.5;cursor:not-allowed}
+.fv-mention-mirror{position:absolute;box-sizing:border-box;overflow:hidden;pointer-events:none;white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;color:var(--fv-ink,#eee);z-index:1}
+.fv-mention-mirror[hidden]{display:none}
+.fv-mention{color:var(--fv-accent,#6cb4ff)}
+.fv-studio textarea.fv-mention-live{color:transparent;caret-color:var(--fv-ink,#eee)}

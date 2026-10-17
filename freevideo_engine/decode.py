@@ -11,21 +11,35 @@ from .rocm_compat import audio_convolutions, video_blas
 from .vae_tiles import TileDecoder, compile_blocks
 
 
+DECODE_LABELS = {
+    'vae_load': 'Loading video VAE',
+    'video_decode': 'Decoding the video',
+    'video_postprocess': 'Processing video colors',
+    'rgb_save': 'Saving decoded video',
+    'audio_load_decode': 'Loading and decoding audio',
+    'audio_save': 'Saving decoded audio',
+    'mp4_save': 'Saving MP4 and audio',
+}
+
+
 @torch.no_grad()
 def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, prefetch=True, tile_group=False,
                    preload=False, pin_weights=False, artifacts_dir=None, phase_callback=None,
                    stream_output=False, stream_weights=False, resident_blocks=0, model_cache=None,
-                   linear_compute_cache=False):
+                   linear_compute_cache=False, continuation=None, audio_lead_in_callback=None, output_size=None,
+                   hide_tail_frames=0):
+    from .continuation import validate_hide_tail
+    validate_hide_tail(hide_tail_frames)
+    def phase(name):
+        if phase_callback is not None:
+            phase_callback(name)
+        print(json.dumps({'event': 'decode_phase', 'phase': DECODE_LABELS[name]}), flush=True)
+    phase('vae_load')
     from diffusers import AutoencoderKLMiniMaxH3
     from diffusers.utils.export_utils import encode_video
     from src.inference.render import PIXEL_MEAN, PIXEL_STD, FPS
 
     started = time.perf_counter()
-    def phase(name):
-        if phase_callback is not None:
-            phase_callback(name)
-    phase('vae_load')
-    print(json.dumps({'event': 'decode_phase', 'phase': 'Loading video VAE'}), flush=True)
     vae = None
     weight_source = None
     compute_cache_metrics = None
@@ -118,7 +132,6 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
     load_seconds = time.perf_counter() - started
     decode_started = time.perf_counter()
     phase('video_decode')
-    print(json.dumps({'event': 'decode_phase', 'phase': 'Decoding video tiles'}), flush=True)
     offload_stats = None
     rgb_mapping = None
     streamed_timings = {}
@@ -151,10 +164,10 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
         gc.collect()
         torch.cuda.empty_cache()
         video_decode_seconds = streamed_timings.get('video_decode_seconds', time.perf_counter() - decode_started)
-        phase('video_postprocess')
         # Bound postprocessing memory by frame chunks; use the same FP32 operations
         # and rounding before converting to uint8. Do this on CPU after decoding.
         if not stream_output:
+            phase('video_postprocess')
             frames = torch.empty((video.shape[2], video.shape[3], video.shape[4], 3), dtype=torch.uint8)
             pixel_mean = torch.tensor(PIXEL_MEAN).view(1, -1, 1, 1, 1)
             pixel_std = torch.tensor(PIXEL_STD).view(1, -1, 1, 1, 1)
@@ -162,6 +175,12 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
                 chunk = (video[:, :, start:start + 8].float() * pixel_std + pixel_mean).clamp_(0, 1)
                 frames[start:start + chunk.shape[2]] = (chunk[0].permute(1, 2, 3, 0) * 255).round().to(torch.uint8)
             del video
+        if hide_tail_frames:
+            kept_frames = len(frames) - hide_tail_frames
+            frames = frames[:kept_frames]
+        if continuation is not None:
+            from .continuation import OVERLAP_FRAMES
+            frames = frames[OVERLAP_FRAMES:]
         artifact_seconds = streamed_timings.get('decoded_artifact_save_seconds', 0.)
         if artifacts_dir:
             import numpy as np
@@ -169,12 +188,19 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
             tick = time.perf_counter()
             artifacts_dir = Path(artifacts_dir)
             artifacts_dir.mkdir(parents=True, exist_ok=True)
-            if not stream_output:
-                np.save(artifacts_dir / 'rgb.npy', frames.numpy(), allow_pickle=False)
+            if not stream_output or continuation is not None or hide_tail_frames:
+                # A streamed mapping still contains overlap/hidden frames. Replace its
+                # retained artifact after the mapping closes, below.
+                rgb_path = artifacts_dir / ('rgb-new.npy' if stream_output else 'rgb.npy')
+                np.save(rgb_path, frames.numpy() if hasattr(frames, 'numpy') else frames, allow_pickle=False)
             artifact_seconds += time.perf_counter() - tick
+        elif stream_output and hide_tail_frames:
+            # render_rgb also retains a mapping when no explicit artifacts directory was requested.
+            import numpy as np
+            np.save(directory / 'rgb-new.npy', frames.numpy() if hasattr(frames, 'numpy') else frames,
+                    allow_pickle=False)
         audio_start = time.perf_counter()
         phase('audio_load_decode')
-        print(json.dumps({'event': 'decode_phase', 'phase': 'Loading and decoding audio'}), flush=True)
         audio_vae = None
         if model_cache is not None:
             from .resident_models import key, file_identity
@@ -190,6 +216,7 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
         audio_vae.eval().requires_grad_(False)
         audio_mean = torch.tensor(audio_vae.config.latents_mean, device='cuda').view(1, -1, 1)
         audio_std = torch.tensor(audio_vae.config.latents_std, device='cuda').view(1, -1, 1)
+        print(json.dumps({'event': 'decode_phase', 'phase': 'Decoding audio'}), flush=True)
         audio_input = audio_latents * audio_std + audio_mean
         audio_diagnostics = dict(device=str(audio_input.device), dtype=str(audio_input.dtype),
             autocast_enabled=torch.is_autocast_enabled('cuda'),
@@ -212,6 +239,14 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
         if not audio_diagnostics['finite']:
             raise RuntimeError('Audio VAE returned non-finite samples: '+repr(audio_diagnostics))
         rate = audio_vae.config.sampling_rate
+        if continuation is not None:
+            if audio_lead_in_callback is not None:
+                from .continuation import capture_audio_lead_in
+                audio_lead_in_callback(capture_audio_lead_in(audio, continuation, rate))
+        if hide_tail_frames:
+            audio = audio[:, :round(kept_frames * 40 / 24) * 800]
+        if continuation is not None:
+            audio = audio[:, continuation['audio_latents'] * 800:]
         del audio_vae, audio_mean, audio_std, audio_input
         gc.collect()
         torch.cuda.empty_cache()
@@ -234,14 +269,22 @@ def decode_to_file(latents, audio_latents, out_path, *, base, offload=False, pre
         temporary = destination.with_name(destination.stem + '.partial' + destination.suffix)
         encode_started = time.perf_counter()
         phase('mp4_save')
-        print(json.dumps({'event': 'decode_phase', 'phase': 'Saving MP4 and audio'}), flush=True)
-        encode_video(frames, fps=FPS, output_path=str(temporary), audio=audio, audio_sample_rate=rate)
+        if output_size is not None:
+            # The model rendered a larger size; only the picture is scaled.
+            from .output_fit import fit_frames
+            encode_video(fit_frames(frames, *output_size), fps=FPS, output_path=str(temporary), audio=audio,
+                         audio_sample_rate=rate)
+        else:
+            encode_video(frames, fps=FPS, output_path=str(temporary), audio=audio, audio_sample_rate=rate)
         temporary.replace(destination)
         frame_count = len(frames)
     finally:
         if rgb_mapping is not None:
             del frames
             rgb_mapping._mmap.close()
+            retained = Path(artifacts_dir) if artifacts_dir else directory
+            if (continuation is not None or hide_tail_frames) and (retained / 'rgb-new.npy').is_file():
+                (retained / 'rgb-new.npy').replace(retained / 'rgb.npy')
     return {'vae_load_seconds': load_seconds, 'video_decode_seconds': video_decode_seconds,
             'vae_linear_compute_cache': linear_compute_cache, 'vae_compute_cache_preparation': compute_cache_metrics,
             'resident_vae_cache_hit': vae_cache_hit, 'resident_audio_vae_cache_hit': audio_cache_hit,

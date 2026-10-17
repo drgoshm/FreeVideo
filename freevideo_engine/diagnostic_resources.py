@@ -1,6 +1,7 @@
 """Bounded diagnostic evidence without tensor imports, paths or exception text."""
 import math
 import re
+import statistics
 import sys
 
 
@@ -46,6 +47,21 @@ ENCODER_DTYPES = ('uint8', 'int8', 'int16', 'int32', 'int64', 'float16', 'bfloat
 TENSOR_VARIABLES = ('input', 'output', 'x', 'q', 'scale', 'indices', 'qdata', 'weight', 'mat1', 'mat2')
 
 
+def commit_exhausted(error):
+    """Windows error 1455 anywhere in the chain: the system commit limit is spent.
+
+    Rust-backed file readers raise a plain OSError carrying only the localized
+    system message plus "(os error 1455)", so the numeric attributes are unset.
+    """
+    seen = set()
+    while isinstance(error, BaseException) and id(error) not in seen:
+        seen.add(id(error))
+        if getattr(error, 'winerror', None) == 1455 or re.search(r'(?:os error|winerror)\s*1455\b', str(error), re.I):
+            return True
+        error = error.__cause__ or error.__context__
+    return False
+
+
 def error_details(error):
     """Extract fixed classifications and numbers, never the exception message.
 
@@ -58,7 +74,7 @@ def error_details(error):
         result.update(category='cuda_out_of_memory', error_code=2)
     elif 'CUDA out of memory' in message:
         result['category'] = 'torch_allocator_out_of_memory'
-    elif isinstance(error, MemoryError) or getattr(error, 'winerror', None) == 1455:
+    elif isinstance(error, MemoryError) or commit_exhausted(error):
         result['category'] = 'host_memory_allocation'
     elif 'CUDA error:' in message:
         result['category'] = 'cuda_error'
@@ -110,6 +126,10 @@ def encoder_runtime(value):
         'cuda_initialized_at_start', 'native_imported_at_start') if type(value.get(key)) is bool}
 
 
+PREWARM_FAILURE_KINDS = ('cuda_error', 'worker_stop_unconfirmed', 'cancelled', 'timeout', 'gpu_oom',
+                         'ram_pressure', 'unknown_worker_exit', 'code_error')
+
+
 def encoder_prewarm(value):
     value = mapping(value)
     result = numbers(value, ('elapsed_seconds', 'seconds', 'bytes', 'done_bytes', 'total_bytes',
@@ -121,6 +141,14 @@ def encoder_prewarm(value):
             result[key] = value[key]
     if value.get('purpose') in ('encoder', 'upscale'):
         result['purpose'] = value['purpose']
+    # Why idle preparation stopped, as fixed words only: the receipt's reason
+    # is free text and may name a path. A bare "failed" explained nothing.
+    kind = mapping(value.get('failure')).get('kind', value.get('failure_kind'))
+    if kind in PREWARM_FAILURE_KINDS:
+        result['failure_kind'] = kind
+    error = value.get('error_type')
+    if isinstance(error, str) and len(error) <= 64 and error.isidentifier() and error.isascii():
+        result['error_type'] = error
     return result
 
 
@@ -248,17 +276,18 @@ def failure_cleanup(value):
 def decoder_read_ahead(value):
     """Keep bounded decoder overlap evidence without paths or free-form text."""
     value = mapping(value)
-    result = numbers(value, ('read_bytes', 'total_bytes', 'allowance_bytes',
+    result = numbers(value, ('read_bytes', 'total_bytes', 'allowance_bytes', 'target_bytes',
                              'elapsed_seconds', 'private_buffer_bytes',
                              'gpu_allocation_bytes'))
     state = value.get('state')
-    if state in ('not-started', 'reading', 'ready', 'skipped', 'stopped', 'failed'):
+    if state in ('not-started', 'reading', 'ready', 'partial', 'skipped', 'stopped', 'failed'):
         result['state'] = state
     sampling = mapping(value.get('sampling'))
     if sampling:
         result['sampling'] = numbers(sampling, ('trigger_step', 'steps_remaining',
                                                 'estimated_remaining_seconds',
-                                                'trigger_elapsed_seconds'))
+                                                'trigger_elapsed_seconds', 'drive_reads_last_step',
+                                                'drive_layers'))
     return result
 
 
@@ -298,9 +327,9 @@ def weight_placement(value):
     result = numbers(value, WEIGHT_PLACEMENT)
     if type(value.get('host_prefetch')) is bool:
         result['host_prefetch'] = value['host_prefetch']
-    reason = value.get('host_prefetch_disabled_reason')
-    if reason in ('host_headroom', 'host_allocation_refused', 'live_host_pressure'):
-        result['host_prefetch_disabled_reason'] = reason
+    for key in ('host_prefetch_disabled_reason', 'host_prefetch_shared_reason'):
+        if value.get(key) in ('host_headroom', 'host_allocation_refused', 'live_host_pressure'):
+            result[key] = value[key]
     return result
 
 
@@ -439,11 +468,21 @@ def resources(value):
         if isinstance(observed.get('clock_reason_counts'), dict):
             clean['clock_reason_counts'] = numbers(observed['clock_reason_counts'], tuple(Activity.clock_reasons))
         result['gpu'][key] = clean
+    if isinstance(gpu.get('other_programs'), dict):
+        result['gpu']['other_programs'] = numbers(gpu['other_programs'], ('checks', 'shared_checks', 'check_seconds',
+            'share_percent', 'other_mean_percent', 'other_peak_percent', 'own_mean_percent'))
+        for key in ('supported', 'own_reported'):
+            if type(gpu['other_programs'].get(key)) is bool:
+                result['gpu']['other_programs'][key] = gpu['other_programs'][key]
     return result
 
 
 WINDOWS_BUDGET = ('peak_usage_bytes', 'minimum_budget_bytes', 'maximum_budget_bytes',
                  'first_budget_bytes', 'last_budget_bytes', 'budget_changes', 'over_budget_samples', 'samples')
+# Whole-device NVML samples inside one sampling step (monitoring.step_activity).
+STEP_ACTIVITY = ('samples', 'busy_samples', 'gpu_util_mean_percent', 'sm_clock_mean_mhz', 'power_mean_mw',
+                 'device_used_peak_bytes', 'device_used_minimum_bytes', 'device_total_bytes',
+                 'other_programs_checks', 'other_programs_percent_mean', 'other_programs_percent_peak')
 
 
 def dynamic_budget(value):
@@ -455,9 +494,10 @@ def dynamic_budget(value):
     def clean(row):
         row = mapping(row)
         item = numbers(row, ('elapsed_seconds', 'previous_limit_bytes', 'candidate_limit_bytes',
-            'allocator_limit_bytes', 'live_free_bytes', 'reserved_bytes', 'non_torch_local_bytes', 'driver_budget_bytes'))
+            'allocator_limit_bytes', 'live_free_bytes', 'reserved_bytes', 'non_torch_local_bytes', 'driver_budget_bytes',
+            'device_used_bytes', 'workspace_bytes', 'settle_seconds', 'settle_samples', 'settled_candidate_bytes'))
         for key, allowed in (('stage', ('load', 'sample', 'upscale', 'decode')),
-                             ('action', ('hold', 'pending', 'shrink', 'grow'))):
+                             ('action', ('hold', 'pending', 'shrink', 'settled', 'grow'))):
             if row.get(key) in allowed:
                 item[key] = row[key]
         if type(row.get('driver_available')) is bool:
@@ -504,12 +544,63 @@ def sampling(value):
         for segment in ('local', 'nonlocal'):
             item[segment] = numbers(observed.get(segment),
                 WINDOWS_BUDGET)
+        device = numbers(row.get('device_activity'), STEP_ACTIVITY)
+        if device:
+            item['device'] = device
         result['steps'].append(item)
     observed = mapping(value.get('incomplete_step_windows'))
     result['incomplete_step'] = {segment: numbers(observed.get(segment),
         WINDOWS_BUDGET)
         for segment in ('local', 'nonlocal')}
     result['incomplete_step_compiler'] = sanitize(value.get('incomplete_step_compiler'))
+    return result
+
+
+def mac_condition(value):
+    """Fixed Mac hardware fields; preserve nulls without arbitrary metadata."""
+    if value is None:
+        return None
+    from .macos_conditions import THERMAL_NAMES, PRESSURE_NAMES, VM_COUNTERS
+    value = mapping(value)
+    thermal, pressure = value.get('thermal_state'), value.get('memory_pressure_level')
+    thermal = thermal if type(thermal) is int and thermal in THERMAL_NAMES else None
+    pressure = pressure if type(pressure) is int and pressure in PRESSURE_NAMES else None
+    result = dict(thermal_state=thermal, thermal_state_name=THERMAL_NAMES.get(thermal),
+        memory_pressure_level=pressure, memory_pressure_name=PRESSURE_NAMES.get(pressure),
+        low_power_mode=value.get('low_power_mode') if type(value.get('low_power_mode')) is bool else None,
+        power_source=value.get('power_source') if value.get('power_source') in ('ac', 'battery') else None)
+    for key in ('swap_used_bytes', *VM_COUNTERS):
+        item = value.get(key)
+        result[key] = item if type(item) is int and item >= 0 else None
+    return result
+
+
+def mac_conditions_summary(passes):
+    """Observed maxima and per-step host timing, with unknowns kept explicit."""
+    result = []
+    for row in passes:
+        if 'conditions' not in row and 'block_seconds' not in row:
+            continue
+        samples = sequence(row.get('conditions'))
+        states = [mapping(sample) for sample in samples]
+        def highest(key):
+            values = [sample[key] for sample in states if type(sample.get(key)) is int]
+            return max(values) if values else None
+        low_power = [sample['low_power_mode'] for sample in states if type(sample.get('low_power_mode')) is bool]
+        timings = []
+        for step, blocks in enumerate(sequence(row.get('block_seconds')), 1):
+            values = [item for item in sequence(blocks) if type(item) in (int, float)]
+            timings.append(dict(step=step, blocks=len(values),
+                median_seconds=statistics.median(values) if values else None,
+                max_seconds=max(values) if values else None))
+        result.append(dict(index=row['index'], highest_thermal_state=highest('thermal_state'),
+            highest_memory_pressure_level=highest('memory_pressure_level'),
+            low_power_mode_seen=any(low_power) if low_power else None,
+            power_sources=sorted({sample['power_source'] for sample in states
+                                  if sample.get('power_source') in ('ac', 'battery')}),
+            swap_used_start_bytes=mapping(samples[0]).get('swap_used_bytes') if samples else None,
+            swap_used_end_bytes=mapping(samples[-1]).get('swap_used_bytes') if samples else None,
+            block_step_statistics=timings))
     return result
 
 
@@ -526,7 +617,7 @@ def sampling_passes(value):
             config=numbers(config, ENGINE_KNOBS), offload=weight_placement(row.get('offload')),
             cache_admission=numbers(row.get('pass_cache_admission'), ('gpu_budget_bytes', 'admitted_bytes',
                 'measured_peak_reserved_bytes', 'live_free_bytes', 'commit_available_bytes',
-                'requested_resident_blocks', 'workspace_peak_bytes', 'peak_cache_bytes')),
+                'requested_resident_blocks', 'workspace_peak_bytes', 'peak_cache_bytes', 'device_headroom_bytes')),
             kernels=kernel_receipt(row))
         item['config'].update({key: config[key] for key in ENGINE_KNOBS if type(config.get(key)) is bool})
         refinement = mapping(row.get('refinement'))
@@ -536,8 +627,27 @@ def sampling_passes(value):
         preparation = mapping(row.get('refinement_schedule_preparation'))
         if preparation.get('schedule') == 'community-sigma3-v1':
             item['schedule_cache'] = numbers(preparation, ('seconds', 'table_cache_hits'))
+        pressure = mapping(row.get('step_pressure'))
+        if pressure:
+            item['step_pressure'] = dict(numbers(pressure, ('planned_head_chunk', 'head_chunk_at_end', 'polls', 'unread',
+                'over_polls', 'held_up_layers', 'wide_peak_reserved_bytes')),
+                narrowed_at_end=pressure.get('narrowed_at_end') is True,
+                actions=[dict(action=row['action'], **numbers(row, ('step', 'layer', 'budget_bytes', 'usage_bytes',
+                    'freed_bytes', 'head_chunk_from', 'head_chunk_to', 'layer_seconds')))
+                    for row in map(mapping, sequence(pressure.get('actions'))[:32])
+                    if row.get('action') in ('release_idle', 'narrow', 'restore', 'nothing_left')])
         item['step_seconds'] = [duration for duration in sequence(row.get('step_seconds'))[:32]
                                 if type(duration) in (int, float) and math.isfinite(duration) and duration >= 0]
+        if row.get('device_backend') == 'mps':
+            from .macos_conditions import BLOCK_SECONDS_SCOPE
+            if 'conditions' in row:
+                item['conditions'] = [mac_condition(sample) for sample in sequence(row['conditions'])[:33]]
+            if 'block_seconds' in row:
+                item['block_seconds'] = [[duration if type(duration) in (int, float)
+                    and math.isfinite(duration) and duration >= 0 else None
+                    for duration in sequence(step)[:50]] for step in sequence(row['block_seconds'])[:32]]
+            if row.get('block_seconds_scope') == BLOCK_SECONDS_SCOPE:
+                item['block_seconds_scope'] = BLOCK_SECONDS_SCOPE
         result.append(item)
     return result
 
@@ -600,7 +710,7 @@ def planning(rows):
             ('capacity_bytes', 'available_bytes', 'reserve_bytes', 'budget_bytes', 'minimum_bytes')))
         idle = mapping(row.get('idle_cache'))
         item['idle_cache'] = dict(present=bool(idle), **numbers(idle, ('reclaimable_gpu_bytes',
-            'reclaimable_ram_bytes', 'retained_pinned_ram_bytes')))
+            'reclaimable_ram_bytes', 'reclaimable_commit_bytes', 'retained_pinned_ram_bytes')))
         item['idle_cache']['memory'] = numbers(idle.get('memory'), RAM_SAMPLE)
         item['idle_cache']['gpu_capacity'] = numbers(idle.get('gpu_capacity'),
             ('allocator_limit_bytes', 'owned_allocator_reserved_bytes', 'live_free_bytes',

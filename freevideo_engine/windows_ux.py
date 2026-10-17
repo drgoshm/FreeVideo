@@ -22,9 +22,68 @@ def open_browser(url):
             import os
             os.startfile(url)
             return True
+        from .linux_bundle import child_environment, frozen_linux
+        if frozen_linux():
+            # webbrowser would hand the launcher's own environment to the browser.
+            import shutil
+            import subprocess
+            opener = shutil.which('xdg-open')
+            if opener:
+                command = [opener, url]
+            else:
+                # Without xdg-open, start the browser webbrowser would choose (gio open,
+                # x-www-browser, firefox...) the same way.
+                import webbrowser
+                try:
+                    browser = webbrowser.get()
+                except webbrowser.Error:
+                    return False
+                command = [browser.name] + [arg.replace('%s', url) for arg in browser.args]
+            try:
+                subprocess.Popen(command, env=child_environment(), stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+            except OSError:
+                return False
+            return True
         import webbrowser
         return webbrowser.open(url, new=2)
 
+
+
+def _viewer_path(path, engine):
+    """A text in an installation deeper than the viewer can open, named through that installation's short folder."""
+    from . import launch_view
+    from .long_paths import plain
+    path = plain(path)
+    try:
+        # The file's own runtime first: it can be another one than the selected.
+        view = launch_view.for_file(path) or (launch_view.for_engine(engine) if engine else launch_view.current())
+    except OSError:
+        return path  # No short folder can be made: the viewer gets the path as it is.
+    return path if view is None else str(launch_view.value(path, view))
+
+
+def open_text(path, *, engine=None):
+    """Show a text file on this computer (a licence, the notices) in the system's text viewer."""
+    path = str(path)
+    with external_python():
+        if windows():
+            path = _viewer_path(path, engine)
+            if path.lower().endswith('.txt'):
+                import os
+                os.startfile(path)
+            else:
+                # LICENSE has no program of its own; Notepad reads it.
+                import subprocess
+                subprocess.Popen(['notepad.exe', path])
+            return True
+        if sys.platform == 'darwin':
+            import subprocess
+            subprocess.Popen(['/usr/bin/open', '-t', path], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, start_new_session=True)
+            return True
+    from pathlib import Path
+    return open_browser(Path(path).as_uri())
 
 def hidden_console():
     """Hide a console and keep it inheritable by native helper processes."""

@@ -48,10 +48,12 @@ def modulation(engine, schedule):
         yield dict(schedule=schedule, table_cache_hits=0)
         return
     manifest = json.loads((Path(engine.cache) / 'manifest.json').read_text(encoding='utf-8'))
-    times = timesteps(device, engine.task)
+    task = getattr(engine, 'adaln_task', engine.task)
+    times = timesteps(device, task)
     cursor = ScheduleCursor(times)
-    cache = TableCache(engine.cache, manifest['source_id'], 3, task=engine.task,
-        manifest=manifest, timesteps=times, channels=model.config.hidden_size, device='cpu')
+    fetch = getattr(engine, 'fetch_tables', True)
+    cache = TableCache(engine.cache, manifest['source_id'], 3, task=task,
+        manifest=manifest, timesteps=times, channels=model.config.hidden_size, device='cpu', fetch=fetch)
     originals = []
     started, hits = time.perf_counter(), 0
     try:
@@ -84,6 +86,8 @@ def modulation(engine, schedule):
                 block.adaln_proj = CachedModulation(values, cursor).to(device)
                 del values
             del embeddings
+        if not fetch and cache.placeholders:
+            engine.table_placeholders.add(cache.root.name)
         engine.schedule_hook.remove()
         engine.cursor = cursor
         engine.schedule_hook = model.register_forward_pre_hook(cursor.before, with_kwargs=True)

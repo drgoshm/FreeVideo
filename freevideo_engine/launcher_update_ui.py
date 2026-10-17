@@ -3,7 +3,7 @@ import time
 import webbrowser
 
 from . import branding
-from .launcher_update import RELEASE_PAGE, launch_download, DownloadedLauncherUnavailable
+from .launcher_update import error_text, release_page, launch_download, DownloadedLauncherUnavailable
 
 
 class UpdateUI:
@@ -39,15 +39,12 @@ class UpdateUI:
         self.detail.pack(fill='both', expand=True)
         self.progress = app.ttk.Progressbar(body, maximum=1); self.progress.pack(fill='x', pady=8)
         self.rate = app.ttk.Label(body, text=''); self.rate.pack(anchor='w')
-        self.access = app.ttk.Frame(body)
-        app.ttk.Label(self.access, text=app.t('GitHub token · private updates · this session only', 'GitHub Token · 私有更新 · 仅本次会话使用')).pack(anchor='w')
-        self.token = app.tk.StringVar(value=self.client.token)
-        app.ttk.Entry(self.access, textvariable=self.token, show='•').pack(fill='x')
         actions = app.ttk.Frame(body); actions.pack(fill='x', pady=(14, 0))
         self.primary = app.ttk.Button(actions, command=self.accept); self.primary.pack(side='left')
         self.dismiss_button = app.ttk.Button(actions, command=self.dismiss)
         self.dismiss_button.pack(side='left', padx=8)
-        app.ttk.Button(actions, text=app.t('Release page', '下载页'), command=lambda: webbrowser.open(RELEASE_PAGE)).pack(side='right')
+        app.ttk.Button(actions, text=app.t('Download manually', '手动下载'),
+                       command=lambda: webbrowser.open(release_page(self.client.current))).pack(side='right')
         d.protocol('WM_DELETE_WINDOW', self.dismiss)
         self.render()
         if self.client.state['status'] in ('idle', 'current', 'cancelled'):
@@ -55,8 +52,8 @@ class UpdateUI:
 
     def dismiss(self):
         self.snoozed = True
-        if self.client.state['status'] == 'downloading':
-            self.client.cancelled.set()
+        if self.client.state['status'] == 'downloading' or self.client.state.get('retry_operation') == 'download':
+            self.client.stop()
         if self.dialog:
             self.dialog.destroy(); self.dialog = None
 
@@ -72,11 +69,10 @@ class UpdateUI:
                 app.close()
             elif row['status'] == 'available' or (row['status'] in ('error', 'cancelled') and row.get('candidate')):
                 if getattr(self.client, 'current', {}).get('packaging') == 'onedir':
-                    webbrowser.open(RELEASE_PAGE)
+                    webbrowser.open(release_page(self.client.current))
                 else:
                     self.client.run('download', row['candidate'])
             else:
-                self.client.token = self.token.get().strip()
                 self.client.run('check')
         except DownloadedLauncherUnavailable:
             self.client.run('download', row['candidate'])
@@ -99,7 +95,7 @@ class UpdateUI:
                     'cancelled': ('Update paused', '更新已停止')}
         self.heading.configure(text=app.t(*headings.get(state, headings['checking'])))
         candidate = row.get('candidate')
-        description = row.get('error', '')
+        description = error_text(row, app.zh)
         if candidate:
             description += ('\n\n' if description else '') + '%s · %s · %s\n%.1f MiB\n\n%s' % (candidate['version'],
                 time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime(candidate['built_at'])), candidate['revision'][:8],
@@ -119,10 +115,6 @@ class UpdateUI:
         self.rate.configure(text=('%.0f%% · %.1f MiB/s · ~%ds' %
             (100*progress['done']/progress['total'], progress['bytes_per_second']/2**20,
              progress['remaining_seconds'])) if progress else '')
-        if state == 'error':
-            self.access.pack(fill='x', pady=8, before=self.primary.master)
-        else:
-            self.access.pack_forget()
         downloadable = state == 'available' or (state in ('error', 'cancelled') and candidate)
         self.primary.configure(text=app.t('Restart & update', '重启并更新') if state == 'ready' else
                                app.t('Download folder ZIP', '下载文件夹版') if downloadable and
@@ -137,6 +129,7 @@ class UpdateUI:
             self.timer = None
         if self.closed:
             return
+        self.client.poll(allow_download=not self.app.controller.busy)
         row = self.client.state
         state = row['status']
         self.button.configure(text=self.app.t('Update available', '有可用更新') if row.get('candidate') else
@@ -153,7 +146,7 @@ class UpdateUI:
 
     def stop(self):
         self.closed = True
-        self.client.cancelled.set()
+        self.client.stop()
         if self.timer is not None:
             self.app.window.after_cancel(self.timer)
             self.timer = None

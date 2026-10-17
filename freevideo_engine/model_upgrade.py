@@ -23,6 +23,8 @@ from pathlib import Path
 import shutil
 import threading
 import time
+from .long_paths import io_path, resolved, plain_errors
+from . import disk_space
 
 GiB = 1 << 30
 MARGIN = 2 * GiB
@@ -30,6 +32,7 @@ TARGET = 'int8_convrot'
 RETRY_SECONDS = 30
 
 
+@plain_errors
 def offer(root):
     """Whether this installation should move to int8 and what that costs, or which
     model files it no longer uses. Reads only."""
@@ -37,7 +40,7 @@ def offer(root):
     from .kernel_capabilities import readiness
     from .prepared_model import catalog as load_catalog, files, preferred_format, select
     from . import variant_cleanup
-    root = Path(root)
+    root = io_path(root)
     try:
         machine = json.loads((root / 'machine.json').read_text(encoding='utf-8'))
         stamp = kernel_receipt(root)
@@ -73,13 +76,14 @@ def offer(root):
     download = setup_download(root, machine, selection)
     fused = variant_cleanup.fused_lora_variants(root, catalog, current)
     release = 0 if fused else variant_cleanup.retire(root, catalog, current)['bytes']
-    free = shutil.disk_usage(root).free
+    free = disk_space.free_bytes(root)
     return dict(status='available' if free >= download + MARGIN else 'low-disk',
                 architecture=hardware.architecture, gpu=hardware.gpu_name, current=current,
                 download_bytes=download, release_bytes=release, free_bytes=free,
                 required_bytes=download + MARGIN, lora_variants=fused, int8_checked=checked)
 
 
+@plain_errors
 def setup_download(root, machine, selection):
     """Bytes the int8 setup run will download, counted as bootstrap.plan counts them.
 
@@ -91,25 +95,25 @@ def setup_download(root, machine, selection):
     from .install_tuning import required_models
     from .prepared_model import files
     from .sampling_assets import install_files
-    rows = required_models(json.loads((PACKAGE / 'model_files.json').read_text(encoding='utf-8')), selection)
+    rows = required_models(json.loads((io_path(PACKAGE) / 'model_files.json').read_text(encoding='utf-8')), selection)
     rows += files(selection)
     prior = {}
     if machine.get('setup_run'):
         try:
-            prior = json.loads((Path(machine['setup_run']) / 'plan.json').read_text(encoding='utf-8'))
+            prior = json.loads((io_path(machine['setup_run']) / 'plan.json').read_text(encoding='utf-8'))
         except (OSError, ValueError):
             prior = {}
     # The same choice setup makes without --sampling-caches: the previous
     # setup's, otherwise none for an installation that is already ready.
     everything = prior['sampling_caches'] if isinstance(prior.get('sampling_caches'), bool) else not machine.get('ready')
     rows += install_files(bool(everything))
-    model_dir = Path(machine.get('model_root') or root / 'models' / 'vdn').expanduser().resolve()
-    encoder_dir = Path(machine.get('encoder_model_root') or prior.get('encoder_dir')
-                       or root / 'models' / 'encoder').expanduser().resolve()
+    model_dir = resolved(Path(machine.get('model_root') or root / 'models' / 'vdn').expanduser())
+    encoder_dir = resolved(Path(machine.get('encoder_model_root') or prior.get('encoder_dir')
+                       or root / 'models' / 'encoder').expanduser())
     present = 0
     for row in rows:
         try:
-            path = model_target(row, model_dir, encoder_dir, selection['directory'])
+            path = io_path(model_target(row, model_dir, encoder_dir, selection['directory']))
             if path.is_file() and path.stat().st_size == row['bytes']:
                 present += row['bytes']
         except (OSError, ValueError):
@@ -120,7 +124,7 @@ def setup_download(root, machine, selection):
 def kernel_receipt(root):
     """Identifies the GPU check receipt as written; it changes when the checks run again."""
     try:
-        info = (Path(root) / 'kernel-capabilities.json').stat()
+        info = (io_path(root) / 'kernel-capabilities.json').stat()
         return [info.st_mtime_ns, info.st_size]
     except OSError:
         return None
@@ -234,7 +238,7 @@ class ModelUpgrade:
                 # larger plan is shown on the card and confirmed again first.
                 planned_bytes = value['model_download_bytes']
                 if planned_bytes > offered['download_bytes'] + 64 * (1 << 20):
-                    free = shutil.disk_usage(root).free
+                    free = disk_space.free_bytes(root)
                     self.state = dict(offered, status='available' if free >= planned_bytes + MARGIN else 'low-disk',
                                       download_bytes=planned_bytes, required_bytes=planned_bytes + MARGIN,
                                       free_bytes=free, resized=True)

@@ -1,0 +1,16 @@
+.fv-feedback textarea{margin-top:16px;min-height:112px}
+.fv-feedback label.fv-check{margin:14px 0 0}
+.fv-feedback .fv-feedback-shot{position:relative;margin:10px 0 0 25px;width:max-content;max-width:calc(100% - 25px)}
+.fv-feedback .fv-feedback-shot img{display:block;max-width:100%;max-height:96px;border:1px solid var(--fv-border);border-radius:var(--fv-r-sm)}
+.fv-feedback .fv-feedback-shot button{position:absolute;top:4px;right:4px;min-height:22px;width:22px;padding:0;line-height:1;border-radius:50%;background:var(--fv-bg);border-color:var(--fv-border);color:var(--fv-ink)}
+.fv-feedback .fv-feedback-actions{display:flex;align-items:center;justify-content:flex-end;gap:14px;margin-top:20px}
+.fv-feedback .fv-feedback-status{flex:1;margin:0;min-width:0;color:#a5b3c6;font-size:13px;line-height:1.45;text-decoration:none}
+.fv-feedback .fv-feedback-actions button{flex:none;min-width:88px}
+/* Keep the entry beside Settings; compact headers use the same labelled button with a line icon. */
+.fv-header-actions>button{white-space:nowrap}
+.fv-feedback-entry>svg{display:none;flex:none;width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round}
+@media(max-width:1040px){.fv-autopilot .fv-feedback-entry>svg{display:block}.fv-autopilot .fv-feedback-label{display:none}}
+@media(max-width:800px){.fv-editor .fv-feedback-entry>svg{display:block}.fv-editor .fv-feedback-label{display:none}}
+@media(max-width:680px){.fv-studio .fv-feedback-entry>svg{display:block}.fv-studio .fv-feedback-label{display:none}}
+/* On a narrow screen the line gets the whole width above the button. */
+@media(max-width:480px){.fv-feedback .fv-feedback-actions{flex-wrap:wrap;row-gap:10px}.fv-feedback .fv-feedback-status{flex:1 0 100%}.fv-feedback .fv-feedback-status:empty{display:none}}

@@ -129,6 +129,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         canvas = geometry(args.width, args.height, frames=args.frames, seconds=args.seconds)
+        from .two_pass import render_canvas
+        canvas = render_canvas(canvas)[0]
         hardware = detect()
         if args.profile:
             profile = json.loads(args.profile.expanduser().read_text(encoding='utf-8'))

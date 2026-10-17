@@ -1,0 +1,23 @@
+.fv-studio .fv-guide-layer{position:fixed;inset:0;z-index:40;pointer-events:none;overflow:hidden;font-family:var(--fv-font);color:var(--fv-ink)}
+.fv-studio .fv-guide-ring{position:absolute;border:2px solid var(--fv-accent);box-shadow:0 0 0 9999px rgb(0 0 0 / 42%);pointer-events:none}
+.fv-studio .fv-guide-bubble{position:absolute;pointer-events:auto;width:340px;max-width:calc(100vw - 48px);padding:20px;border-radius:14px;background:var(--fv-raised);border:1px solid var(--fv-border);box-shadow:0 16px 48px #0005}
+.fv-studio .fv-guide-layer[data-group=editor] .fv-guide-bubble{max-width:calc(100vw - 24px)}
+.fv-studio .fv-guide-message{font-size:14px;font-weight:400;line-height:1.6;text-wrap:balance;margin:0;white-space:normal;overflow-wrap:normal;color:var(--fv-ink)}
+.fv-studio .fv-guide-footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:18px}
+.fv-studio .fv-guide-dots{display:flex;align-items:center;gap:6px;flex-shrink:0}
+.fv-studio .fv-guide-dot{width:5px;height:5px;border-radius:50%;background:color-mix(in srgb,var(--fv-muted) 40%,transparent)}
+.fv-studio .fv-guide-dot.is-current{background:var(--fv-accent)}
+.fv-studio .fv-guide-actions{display:flex;align-items:center;gap:8px}
+.fv-studio button.fv-guide-skip,.fv-studio button.fv-guide-next{min-height:36px;height:36px;padding:6px 13px;border-radius:var(--fv-r-sm,8px);font-size:13px;line-height:1.5;white-space:nowrap}
+.fv-studio button.fv-guide-skip{background:transparent;border-color:transparent;color:var(--fv-muted);font-weight:var(--fv-medium,500)}
+.fv-studio button.fv-guide-skip:hover{background:color-mix(in srgb,var(--fv-ink) 5%,transparent);color:var(--fv-ink)}
+.fv-studio button.fv-guide-next{background:var(--fv-accent);border-color:var(--fv-accent);color:var(--fv-bg);font-weight:var(--fv-semibold,600)}
+.fv-studio button.fv-guide-next:hover{background:var(--fv-accent-hover,var(--fv-accent));border-color:var(--fv-accent-hover,var(--fv-accent))}
+.fv-studio .fv-guide-arrow{position:absolute;width:12px;height:12px;background:var(--fv-raised);transform:rotate(45deg)}
+.fv-studio .fv-guide-bubble[data-side=right] .fv-guide-arrow{left:-7px;border-left:1px solid var(--fv-border);border-bottom:1px solid var(--fv-border)}
+.fv-studio .fv-guide-bubble[data-side=left] .fv-guide-arrow{right:-7px;border-top:1px solid var(--fv-border);border-right:1px solid var(--fv-border)}
+.fv-studio .fv-guide-bubble[data-side=above] .fv-guide-arrow{bottom:-7px;border-right:1px solid var(--fv-border);border-bottom:1px solid var(--fv-border)}
+.fv-studio .fv-guide-bubble[data-side=below] .fv-guide-arrow{top:-7px;border-left:1px solid var(--fv-border);border-top:1px solid var(--fv-border)}
+.fv-studio .fv-guide-wait{position:absolute;top:76px;right:24px;z-index:40;display:flex;align-items:center;gap:16px;max-width:calc(100% - 48px);padding:14px 18px;background:var(--fv-raised);border:1px solid var(--fv-border);border-radius:var(--fv-r-sm);box-shadow:0 8px 24px #0005}
+.fv-studio .fv-guide-wait p{margin:0;font-size:14px;line-height:1.6}
+@media(prefers-reduced-motion:reduce){.fv-studio .fv-guide-layer *{transition:none!important;animation:none!important}}

@@ -86,6 +86,14 @@ def _canonical_config(config, purpose):
     for name in ('task', 'steps'):
         if name not in engine:
             resolved_engine.pop(name, None)
+    # The ordinary task's schedule has the same historical computation identity.
+    if resolved_engine.get('adaln_task') in (None, engine.get('task', 't2va')):
+        resolved_engine.pop('adaln_task', None)
+    # Runs without a step cache keep their historical identity; a cache changes the arithmetic.
+    if resolved_engine.get('step_cache') is None:
+        resolved_engine.pop('step_cache', None)
+    if resolved_decoder.get('continuation') is None:
+        resolved_decoder.pop('continuation', None)
     normalized_engine = _computation(resolved_engine)
     normalized_engine.pop('allocator_config', None)
     return {'engine': normalized_engine, 'decoder': _computation(resolved_decoder),
@@ -289,6 +297,8 @@ class ResourceHistory:
 
     def _recover(self, db):
         recovered=[]
+        # Requests found unsettled together were cut short by the same event.
+        batch=uuid.uuid4().hex
         for row in db.execute("SELECT * FROM attempts WHERE state='pending'").fetchall():
             if process_state(json.loads(row['owner_json'])) != 'dead':
                 continue
@@ -303,7 +313,7 @@ class ResourceHistory:
                            (time.time(), _json(details), row['id']))
                 continue
             from .compatibility import Store
-            Store(self.path.parent).incident(record, 'unfinished_request_after_owner_and_worker_exit')
+            Store(self.path.parent).incident(record, 'unfinished_request_after_owner_and_worker_exit', batch=batch)
             db.execute('DELETE FROM attempts WHERE id=?',(row['id'],))
         return recovered
 
@@ -407,6 +417,17 @@ class ResourceHistory:
             observed = self._observation(observation, row)
             merged = json.loads(row['details_json'])
             merged.update(details or {})
+            if outcome == 'success':
+                from .compatibility import Store
+                try:
+                    compatibility = Store(self.path.parent).success(self._row(row))
+                    if compatibility is not None:
+                        merged['compatibility'] = compatibility
+                except Exception as error:
+                    # Optional compatibility bookkeeping, whatever is wrong with its
+                    # stored state, cannot lose a completed video or turn its settlement
+                    # into another failed attempt.
+                    merged['compatibility_error'] = repr(error)
             db.execute('UPDATE attempts SET state=?,settled=?,details_json=?,observation_json=? WHERE id=?',
                        (outcome, time.time(), _json(merged), observed, attempt_id))
             return self._row(db.execute('SELECT * FROM attempts WHERE id=?', (attempt_id,)).fetchone())
@@ -452,3 +473,19 @@ class ResourceHistory:
         with self._transaction() as db:
             rows = [self._row(row) for row in db.execute(query, arguments)]
         return list(reversed(rows)) if limit is not None else rows
+
+    def requests(self, *, limit):
+        """The newest successful generations, oldest first, measured or not.
+
+        A preview and its upscale succeed without a resource observation, so
+        observations() leaves them out; their geometry and placement evidence
+        still say what was asked for.
+        """
+        if type(limit) is not int or limit <= 0:
+            raise ValueError('Request limit must be a positive integer')
+        query = ("SELECT id,state,started,settled,purpose,phase,geometry_json,details_json,observation_json "
+                 "FROM attempts WHERE state='success' AND purpose='generation' "
+                 "ORDER BY started DESC,id DESC LIMIT ?")
+        with self._transaction() as db:
+            rows = [self._row(row) for row in db.execute(query, (limit,))]
+        return list(reversed(rows))

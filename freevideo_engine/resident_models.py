@@ -8,6 +8,8 @@ import torch
 from .torch_compat import empty_host_cache, host_cache_release_supported
 
 GiB = 1 << 30
+# Where a preview's sampling peak is kept, apart from its complete request's.
+PREVIEW_STAGE = 'engine_preview'
 
 
 def key(value):
@@ -43,12 +45,15 @@ def gpu_bytes(model):
     return sum(storages.values())
 
 
-def pinned_cpu_storages(model):
+def pinned_cpu_storages(model, *, committed=False):
     """Owned, physically backed weights which eviction can actually release.
 
     Mapped/pageable weights are excluded: Linux already credits clean file
     cache, and Windows commit is not resident RAM. Count storage once even
     when several tensor views (or model entries) share a pinned plane.
+    ``committed`` also leaves out registered read-only checkpoint maps: they
+    are resident while pinned, but file-backed, so releasing them returns no
+    commit.
     """
     if hasattr(model, 'transformer'):
         model = model.transformer
@@ -56,18 +61,37 @@ def pinned_cpu_storages(model):
         model = model.cond_stage_model
     if model is None:
         return {}
+    from .encoder_checkpoint import owns_readonly_tensor
     storages = {}
     for tensor in list(model.parameters()) + list(model.buffers()):
         if tensor.device.type != 'cpu':
             continue
         try:
-            if tensor.is_pinned():
+            if tensor.is_pinned() and not (committed and owns_readonly_tensor(tensor)):
                 storage = tensor.untyped_storage()
                 storages[storage.data_ptr()] = storage.nbytes()
         except (NotImplementedError, RuntimeError):
             # Unknown wrapper ownership earns no speculative RAM allowance.
             continue
     return storages
+
+
+def is_parked(model):
+    """Whether an engine handed its GPU weights to host memory with park()."""
+    return type(getattr(model, 'parked', None)) is list
+
+
+def parked_bytes(model):
+    """Host bytes of weights an engine moved off the GPU with park()."""
+    if not is_parked(model):
+        return 0
+    records = model.parked
+    total = 0
+    for module, kind, name in records:
+        tensor = getattr(module, kind).get(name)
+        if tensor is not None:
+            total += tensor.numel() * tensor.element_size()
+    return total
 
 
 def release_encoder(clip, manager):
@@ -125,6 +149,12 @@ class ModelBank:
         self.gpu_reserve = 0
         self.ram_budget = None
         self.decisions = []
+        # Set by a request that can read the whole device: bytes no process
+        # holds, and the growth reserve that request keeps out of them. The
+        # planning budget already excludes that reserve; the device reading
+        # does not.
+        self.device_free = None
+        self.device_reserve = 0
 
     def configure(self, gpu_budget, ram_budget=None, *, gpu_reserve=0):
         self.gpu_budget = int(gpu_budget)
@@ -175,6 +205,38 @@ class ModelBank:
                                    host_cache_released=host_cache_released,
                                    released_gpu_bytes=max(0, before - torch.cuda.memory_allocated())))
 
+    def park(self, role, reason, ram_need=2*GiB):
+        """Release only an idle engine's GPU weights and keep its host side.
+
+        Only when live RAM also covers the parked copy beside the next stage's
+        own need; otherwise the caller releases the whole model as before.
+        """
+        entry = self.entries.get(role)
+        model = entry['model'] if entry else None
+        if role != 'engine' or not callable(getattr(model, 'park', None)) or is_parked(model):
+            return False
+        held = gpu_bytes(model)
+        def declined(why):
+            self.decisions.append(dict(action='keep_declined', role=role, reason=why, gpu_bytes=held))
+            return False
+        if not self.ram_fits(ram_need + held):
+            return declined('Host memory does not cover the parked weights beside the next stage')
+        started = time.perf_counter()
+        before = torch.cuda.memory_allocated()
+        moved = model.park()
+        if moved is None:
+            return declined('Weights share storage; a per-tensor copy would duplicate it')
+        torch.cuda.empty_cache()
+        released = max(0, before - torch.cuda.memory_allocated())
+        if released < .9 * moved:
+            # Something outside the registered tensors still holds these
+            # weights, so parking would keep two copies. The caller releases
+            # the model as before; copying back first could itself not fit.
+            return declined('GPU weights are still referenced elsewhere')
+        self.decisions.append(dict(action='park', role=role, reason=reason, parked_bytes=moved,
+                                   released_gpu_bytes=released, seconds=time.perf_counter() - started))
+        return True
+
     def clear(self, reason='Request failed or session configuration changed'):
         for role in list(self.entries):
             self.drop(role, reason)
@@ -204,26 +266,77 @@ class ModelBank:
         weights = sum(t.numel()*t.element_size() for t in list(model.parameters()) + list(model.buffers()))
         area = canvas.get('width', 1344)*canvas.get('height', 768)/(1344*768)
         workspace = 2*GiB if audio else max(2*GiB, 6*GiB*area)
-        self.make_room('input_audio_vae' if audio else 'input_video_vae', weights + workspace)
+        # The same stage also grows this whole process's host memory: the
+        # video encoder's checkpoint pages and the decoded reference frames
+        # rose by more than 13 GiB at 960x544 (about 26 GiB per full 1344x768
+        # canvas) beside an idle engine's pinned weights. That pushed a
+        # 25.6 GiB budget through its RAM guard and failed the continued
+        # segment. The GPU estimate says nothing about host memory, so an idle
+        # model's host copy is released unless the live budget covers the
+        # stage as well. Plentiful hosts keep it for reuse.
+        host = weights + (2*GiB if audio else max(8*GiB, 26*GiB*area))
+        self.make_room('input_audio_vae' if audio else 'input_video_vae', weights + workspace, ram_need=host)
 
-    def make_room(self, role, peak, *, model=None, ram_need=2*GiB):
+    def device_ceiling(self):
+        """What this process's allocator can hold before the device itself is full.
+
+        Its own pool plus what no process holds. Under Windows neither CUDA's
+        free memory nor the allocator budget counts other applications until
+        the device is already full. None when the device cannot be read.
+        """
+        read = self.device_free
+        if not callable(read):
+            return None
+        try:
+            free = read()
+        except (OSError, RuntimeError, AttributeError, ValueError):
+            return None
+        if type(free) is not int or free < 0:
+            return None
+        return free + torch.cuda.memory_reserved()
+
+    def make_room(self, role, peak, *, model=None, ram_need=2*GiB, device=False):
         retained = gpu_bytes(model) if model is not None else 0
         extra = max(0, int(peak) - retained)
-        before = self.available()
+        # Read once: releasing a model moves its bytes from this pool to the
+        # device's free memory and leaves their sum where it was.
+        ceiling = self.device_ceiling() if device else None
+        reserve = max(self.gpu_reserve, self.device_reserve)
+        budgeted = self.available
+        def available():
+            room = budgeted()
+            if ceiling is not None:
+                room = min(room, max(0, ceiling - torch.cuda.memory_allocated() - reserve))
+            return room
+        before = available()
         # Once conditioning is ready the current video cannot use the encoder
         # again. Reclaim its speculative weights before a VAE needed later in
         # this very request, regardless of how recently preloading touched it.
         def eviction_order(item):
             return (0 if item == 'encoder' and role != 'encoder' else 1, self.entries[item]['used'])
         for other in sorted(self.entries, key=eviction_order):
-            if self.available() >= extra and self.ram_fits(ram_need):
+            if available() >= extra and self.ram_fits(ram_need):
                 break
-            if other != role:
-                self.drop(other, 'Next %s stage needs memory; cached weights are reclaimable' % role)
+            if other == role:
+                continue
+            if is_parked(self.entries[other]['model']):
+                # A parked engine holds no GPU memory; only RAM releases it.
+                if self.ram_fits(ram_need):
+                    continue
+            elif self.available() < extra and self.park(
+                    other, 'Next %s stage needs GPU memory; host copy kept for the next request' % role, ram_need):
+                continue
+            self.drop(other, 'Next %s stage needs memory; cached weights are reclaimable' % role)
         self.decisions.append(dict(action='admit', role=role, estimated_peak_bytes=int(peak),
             reused_model_bytes=retained, additional_bytes=extra, available_before_bytes=before,
-            available_after_bytes=self.available(), budget_bytes=self.gpu_budget,
+            available_after_bytes=available(), budget_bytes=self.gpu_budget,
             reason='Keep idle models when live resources cover the next stage; estimates do not certify capacity'))
+        if ceiling is not None:
+            self.decisions[-1]['device_ceiling_bytes'] = ceiling
+
+    def engine_on_gpu(self):
+        entry = self.entries.get('engine')
+        return entry is not None and not is_parked(entry['model'])
 
     def engine_key(self, request):
         return key(dict(cache=file_identity(Path(request['cache'])/'manifest.json'),
@@ -239,13 +352,21 @@ class ModelBank:
         # Keep the existing affordable cache rather than rereading every block
         # just to pin one more layer. A lower cap must still release the old
         # placement; never silently retain pins beyond a reduced RAM budget.
-        retained_pin_gb = getattr(found, 'config', {}).get('pin_host_gb', 0.)
+        # The allowance is a ceiling the load may not have reached, and free
+        # RAM moves it between requests: compare what the cache really pinned.
+        config = getattr(found, 'config', {})
+        retained_pin_gb = config.get('pin_host_gb', 0.)
         requested_pin_gb = options.get('pin_host_gb', 0.)
-        if found is not None and retained_pin_gb > requested_pin_gb:
+        pinned = config.get('pinned_host_allocated_bytes') or config.get('pinned_model_bytes')
+        held_pin_gb = min(retained_pin_gb, pinned / 1e9) if type(pinned) is int and pinned > 0 else retained_pin_gb
+        if found is not None and held_pin_gb > requested_pin_gb:
             self.drop('engine', 'Host weight cache allowance decreased')
             found = None
         hit = found is not None
         rows = canvas.get('video_tokens', 72576) + canvas.get('reference_video_tokens', 0) + canvas.get('reference_audio_tokens', 0)
+        if canvas.get('early_reference') is not None:
+            from .two_pass import placement_tokens
+            rows = placement_tokens(canvas)
         from .policy import BLOCK_BYTES, activation_bytes, windows_gpu_output_workspace
         from .system import windows
         # Use the same measured token/head envelopes as placement. The old
@@ -264,14 +385,30 @@ class ModelBank:
                 max(0, activation_bytes(head, rows) - activation_bytes(8, rows)))
             source = 'windows_gpu_output_workspace'
         estimate = int(options.get('resident_blocks', 0)*BLOCK_BYTES + workspace)
-        observed = self.peaks.get(('engine', identity))
+        # A preview samples the first pass alone, under the key of the request
+        # it previews. Its peak is evidence for another preview only: an
+        # upscale of it runs the second pass, whose workspace is about twice
+        # as large, and an idle audio decoder admitted on the preview's figure
+        # stayed on the card through that pass. A complete request's peak
+        # covers a preview too.
+        preview = request.get('preview') is True
+        observed = self.peaks.get((PREVIEW_STAGE if preview else 'engine', identity))
+        if observed is None and preview:
+            observed = self.peaks.get(('engine', identity))
         peak = estimate if observed is None else observed
-        self.make_room('engine', peak, model=found)
+        # Sampling is the long stage: an idle model stays through it only where
+        # the device still holds both beside every other application.
+        self.make_room('engine', peak, model=found, device=True)
         self.decisions[-1]['evidence'] = dict(source=source if observed is None else 'complete_local_stage_peak',
             cold_estimate_bytes=estimate, observed_peak_bytes=observed, video_and_reference_tokens=rows,
             head_chunk=options.get('head_chunk', 8), window_batch=options.get('window_batch', 1),
             requested_pin_host_gb=requested_pin_gb,
             retained_pin_host_gb=retained_pin_gb if hit else None)
+        if found is not None and is_parked(found):
+            started = time.perf_counter()
+            moved = found.unpark()
+            self.decisions.append(dict(action='unpark', role='engine', moved_bytes=moved,
+                                       seconds=time.perf_counter() - started))
         if found is None:
             found = factory()
             self.put('engine', identity, found)
@@ -315,7 +452,10 @@ class ModelBank:
             # The streamed decoder installs offload hooks on a different model;
             # its workspace cannot credit a cached full-GPU decoder it won't use.
             self.drop('video_vae', 'The requested streamed decoder cannot reuse the full-GPU VAE')
-            need = (options.get('resident_blocks', 0)*268574720 + 4*GiB)
+            from .policy import decoder_block_bytes
+            need = (options.get('resident_blocks', 0)
+                    * decoder_block_bytes(linear_compute_cache=bool(options.get('linear_compute_cache')))
+                    + 4*GiB)
         else:
             need = 15*GiB + max(0, (canvas.get('video_tokens', 72576)-72576)*30000)
         need = self.peaks.get(('decode', key(dict(options=options, canvas=canvas))), need)
@@ -328,9 +468,12 @@ class ModelBank:
         uuid = str(getattr(torch.cuda.get_device_properties(0), 'uuid', ''))
         if uuid and not uuid.startswith(('GPU-', 'MIG-')):
             uuid = 'GPU-' + uuid
-        host = {}
+        host, committed = {}, {}
         for entry in self.entries.values():
             host.update(pinned_cpu_storages(entry['model']))
+            committed.update(pinned_cpu_storages(entry['model'], committed=True))
+        # Parked engine weights: private host copies, freed with the model.
+        parked = sum(parked_bytes(entry['model']) for entry in self.entries.values())
         memory, gpu_capacity = None, None
         from .system import windows
         if windows():
@@ -343,9 +486,11 @@ class ModelBank:
             gpu_capacity = owned_pool_capacity(torch)
         can_release_host = host_cache_release_supported(torch)
         return dict(reclaimable_gpu_bytes=torch.cuda.memory_reserved(),
-                    reclaimable_ram_bytes=sum(host.values()) if can_release_host else 0,
-                    retained_pinned_ram_bytes=sum(host.values()), host_cache_release_supported=can_release_host,
+                    reclaimable_ram_bytes=(sum(host.values()) if can_release_host else 0) + parked,
+                    reclaimable_commit_bytes=(sum(committed.values()) if can_release_host else 0) + parked,
+                    retained_pinned_ram_bytes=sum(host.values()), parked_ram_bytes=parked,
+                    host_cache_release_supported=can_release_host,
                     memory=memory, gpu_capacity=gpu_capacity,
-                    ram_credit_scope='Owned pinned model storage only; deduplicated, reclaimable on eviction. No mapped-page, commit or swap credit.',
+                    ram_credit_scope='Owned pinned model storage and parked engine weights; deduplicated, reclaimable on eviction. No mapped-page or swap credit; commit only for private storage.',
                     gpu_uuid=uuid, models=[dict(role=role, gpu_bytes=gpu_bytes(entry['model']))
                                            for role, entry in self.entries.items()], decisions=self.decisions)

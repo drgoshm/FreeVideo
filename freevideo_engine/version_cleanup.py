@@ -20,6 +20,10 @@ itself wrote:
 * launcher/application/<sha256>/ in the installation: the launcher an earlier
   desktop shortcut started, checked by its digest; never the current target or
   one any shortcut, pinned item or Dock item starts;
+* application/<sha256>/ in the launcher folder: the same copies for
+  installations too deep for a shortcut path; never one any shortcut, pinned
+  item or running launcher starts, this installation's target, or a copy of a
+  running launcher's own version;
 * envs/comfyui-*: a separate environment for this same ComfyUI folder that the
   current one replaced;
 * the downloaded PyTorch wheel archives, once every environment has them.
@@ -41,9 +45,11 @@ import sys
 import time
 import uuid
 
-from .installation_cleanup import local_path
+from .installation_cleanup import local_path, root_path
 from .monitoring import save
+from .long_paths import io_path, resolved as resolved_io, plain, plain_text, plain_data
 from .system import windows
+from .runtime_alias import is_junction, real_path, checked_real_path, AliasUnavailable
 
 VERSION = re.compile(r'\d{4}\.\d{1,2}\.\d{1,2}\.\d{1,6}-[0-9a-f]{16}(?:-[0-9a-f]{8})?')
 DIGEST = re.compile(r'[0-9a-f]{64}(?:-[0-9a-f]{8})?')
@@ -53,8 +59,13 @@ EXECUTABLES = ('FreeVideo.exe', 'FreeVideo-Linux-x86_64.AppImage')
 
 
 def tree_bytes(path):
+    try:
+        path = resolved_io(checked_real_path(path))
+    except AliasUnavailable:
+        return 0
     total = 0
     for directory, folders, files in os.walk(path, followlinks=False):
+        folders[:] = [name for name in folders if not is_junction(Path(directory) / name)]
         for name in files:
             try:
                 info = os.lstat(os.path.join(directory, name))
@@ -66,6 +77,7 @@ def tree_bytes(path):
 
 
 def digest(path):
+    path = io_path(checked_real_path(path))
     value = hashlib.sha256()
     with Path(path).open('rb') as stream:
         for block in iter(lambda: stream.read(1 << 20), b''):
@@ -74,12 +86,15 @@ def digest(path):
 
 
 def plain_tree(path):
-    """No links or junctions anywhere below path; anything unreadable counts as one."""
+    """No redirects, retained originals or unreadable entries below path."""
     def unreadable(error):
         raise error
     try:
+        path = resolved_io(checked_real_path(path))
         for directory, folders, files in os.walk(path, followlinks=False, onerror=unreadable):
             for name in [*folders, *files]:
+                if '.replaced-' in name:
+                    return False
                 info = os.lstat(os.path.join(directory, name))
                 if stat.S_ISLNK(info.st_mode) or getattr(info, 'st_file_attributes', 0) & 0x400:
                     return False
@@ -103,7 +118,7 @@ def references():
             values += (process.environ().get('PYTHONPATH') or '').split(os.pathsep)
         except (psutil.Error, OSError):
             pass  # Another user's process cannot run our copies.
-        found += [os.path.normcase(str(value)) for value in values if value]
+        found += [os.path.normcase(plain_text(value)) for value in values if value]
     return found
 
 
@@ -111,9 +126,22 @@ def started_from(path, running):
     """Whether a running process uses path, by the references captured for this run."""
     if running is None:
         return True
-    prefix = os.path.normcase(os.path.abspath(path))
+    path = real_path(path)
+    prefix = os.path.normcase(os.path.abspath(plain(path)))
+    def reference(value):
+        value = plain_text(value)
+        if windows():
+            # Process arguments can name the same installation through FV.
+            # Keep the option prefix so the existing suffix/child test applies.
+            option, separator, target = value.partition('=')
+            part = target if separator and option.startswith('-') else value
+            translated = real_path(part)
+            if translated != Path(part):
+                return option + separator + str(translated) if part == target else str(translated)
+        return value
     # The folder itself, a path inside it, or an option ending with it (--root=...).
-    return any(value.endswith(prefix) or prefix + os.sep in value for value in running)
+    values = (os.path.normcase(plain_text(reference(value))) for value in running)
+    return any(value.endswith(prefix) or prefix + os.sep in value for value in values)
 
 
 def remove(path, root, running=None):
@@ -122,7 +150,13 @@ def remove(path, root, running=None):
     A deletion that stops part-way leaves the renamed folder, which a later run
     finishes; nothing else ever has that name.
     """
-    path, root = Path(path), Path(root)
+    try:
+        path, root = checked_real_path(path), checked_real_path(root)
+        if is_junction(path) or started_from(io_path(path), running):
+            return 0
+        root, path = root_path(root, path)
+    except AliasUnavailable:
+        return 0
     if not local_path(root, path) or not plain_tree(path) or started_from(path, running):
         return 0
     size = tree_bytes(path)
@@ -137,10 +171,17 @@ def remove(path, root, running=None):
 
 def finish_retired(parent, root, pattern):
     """Folders an earlier run renamed but could not finish deleting."""
+    try:
+        root, parent = root_path(root, parent)
+    except AliasUnavailable:
+        return 0
     released = 0
-    for path in sorted(Path(parent).glob('*.retired-*')):
+    if not local_path(root, parent):
+        return released
+    for path in sorted(io_path(parent).glob('*.retired-*')):
         match = RETIRED.fullmatch(path.name)
-        if match and pattern.fullmatch(match['name']) and path.is_dir() and local_path(Path(root), path):
+        if (match and pattern.fullmatch(match['name']) and path.is_dir()
+                and local_path(Path(root), path) and plain_tree(path)):
             size = tree_bytes(path)
             shutil.rmtree(path, ignore_errors=True)
             released += size if not path.exists() else 0
@@ -150,11 +191,14 @@ def finish_retired(parent, root, pattern):
 def unchanged_source(path):
     """A materialized source exactly as deployed: launcher-source.json still describes every file."""
     try:
+        path = resolved_io(checked_real_path(path))
         rows = json.loads((path / 'launcher-source.json').read_text(encoding='utf-8'))['sha256']
         if not isinstance(rows, dict) or not rows:
             return False
         seen = set()
         for directory, folders, files in os.walk(path, followlinks=False):
+            if any(is_junction(Path(directory) / name) for name in folders):
+                return False  # Refuse the source before walking a redirected child.
             for name in files:
                 item = Path(directory) / name
                 relative = item.relative_to(path).as_posix()
@@ -174,17 +218,19 @@ def unchanged_source(path):
 
 def editable_sources(engine):
     """Sources an environment installed in editable mode still imports from."""
-    from urllib.parse import urlsplit
-    from urllib.request import url2pathname
+    try:
+        engine = resolved_io(checked_real_path(engine))
+    except AliasUnavailable:
+        return {None}
+    from .engine_binding import editable_source
     found = set()
     for pattern in ('envs/*/Lib/site-packages/freevideo_engine-*.dist-info/direct_url.json',
                     'envs/*/lib/python3*/site-packages/freevideo_engine-*.dist-info/direct_url.json'):
-        for path in Path(engine).glob(pattern):
+        for path in io_path(engine).glob(pattern):
             try:
-                value = json.loads(path.read_text(encoding='utf-8'))
-                url = urlsplit(value['url'])
-                if url.scheme == 'file' and (value.get('dir_info') or {}).get('editable'):
-                    found.add(url2pathname(url.netloc and '//' + url.netloc + url.path or url.path))
+                source = editable_source(path)
+                if source is not None:
+                    found.add(str(source))
             except (OSError, ValueError, KeyError, TypeError, AttributeError):
                 found.add(None)  # An unreadable record could name any source.
     return found
@@ -192,7 +238,7 @@ def editable_sources(engine):
 
 def resolved(value):
     try:
-        return Path(value).resolve() if value else None
+        return resolved_io(checked_real_path(value)) if value else None
     except (OSError, ValueError, TypeError):
         return None
 
@@ -212,27 +258,35 @@ def sources(parent, root, keep, current):
     an earlier version of this one.
     """
     rows = []
-    parent = Path(parent)
+    try:
+        root, parent = root_path(root, parent)
+    except AliasUnavailable:
+        return rows
     newest = version(current) if current else None
     if newest is None or not parent.is_dir() or not local_path(Path(root), parent):
         return rows
     keep = {path for path in map(resolved, keep) if path}
     for path in sorted(parent.iterdir()):
-        if not VERSION.fullmatch(path.name) or path.is_symlink() or not path.is_dir() or path.resolve() in keep:
+        if (not VERSION.fullmatch(path.name) or path.is_symlink() or is_junction(path)
+                or not path.is_dir() or path.resolve() in keep):
             continue
         if (version(path) or newest) < newest and unchanged_source(path):
-            rows.append(path)
+            rows.append(Path(plain(path)))
     return rows
 
 
 def downloads(parent, root, keep):
     """Launcher updates other than the running and the approved one."""
     rows = []
-    parent = Path(parent)
+    try:
+        root, parent = root_path(root, parent)
+    except AliasUnavailable:
+        return rows
     if not parent.is_dir() or not local_path(Path(root), parent):
         return rows
     for path in sorted(parent.iterdir()):
-        if not DIGEST.fullmatch(path.name) or path.is_symlink() or not path.is_dir() or path.name[:64] in keep:
+        if (not DIGEST.fullmatch(path.name) or path.is_symlink() or is_junction(path)
+                or not path.is_dir() or path.name[:64] in keep):
             continue
         try:
             names = [item.name for item in path.iterdir()]
@@ -242,22 +296,28 @@ def downloads(parent, root, keep):
                 continue
         except OSError:
             continue  # Unreadable: kept.
-        rows.append(path)
+        rows.append(Path(plain(path)))
     return rows
 
 
 def applications(parent, root, keep):
     """Launchers behind earlier desktop shortcuts, checked against the digest that names them."""
     rows = []
-    parent = Path(parent)
+    try:
+        root, parent = root_path(root, parent)
+    except AliasUnavailable:
+        return rows
     if not parent.is_dir() or not local_path(Path(root), parent):
         return rows
     keep = {path for path in map(resolved, keep) if path}
     for path in sorted(parent.iterdir()):
-        if not DIGEST.fullmatch(path.name) or path.is_symlink() or not path.is_dir() or path.resolve() in keep:
+        if (not DIGEST.fullmatch(path.name) or path.is_symlink() or is_junction(path)
+                or not path.is_dir() or path.resolve() in keep):
             continue
         try:
             names = sorted(item.name for item in path.iterdir())
+            if 'launcher-build.json' in names:
+                names.remove('launcher-build.json')
             if names == ['FreeVideo.app']:
                 # The Mac copy is named by its executable and Info.plist digests.
                 contents = path / 'FreeVideo.app' / 'Contents'
@@ -271,7 +331,7 @@ def applications(parent, root, keep):
         except OSError:
             continue  # Unreadable: kept.
         if actual == path.name[:64]:
-            rows.append(path)
+            rows.append(Path(plain(path)))
     return rows
 
 
@@ -279,11 +339,15 @@ def environments(engine, current):
     """Separate ComfyUI environments for the current ComfyUI folder that the current one replaced."""
     rows = []
     try:
+        engine, current = checked_real_path(engine), checked_real_path(current)
+        engine, current = resolved_io(engine), io_path(current)
         current_identity = json.loads((current / 'freevideo-host.json').read_text(encoding='utf-8'))
     except (OSError, ValueError, TypeError):
         return rows
+    if not local_path(engine, engine / 'envs'):
+        return rows
     for path in sorted((engine / 'envs').glob('comfyui-*')):
-        if (not ENVIRONMENT.fullmatch(path.name) or path.is_symlink() or not path.is_dir()
+        if (not ENVIRONMENT.fullmatch(path.name) or path.is_symlink() or is_junction(path) or not path.is_dir()
                 or path.resolve() == current.resolve()):
             continue
         try:
@@ -291,16 +355,22 @@ def environments(engine, current):
         except (OSError, ValueError):
             continue  # Without a receipt the owner is uncertain.
         if isinstance(identity, dict) and identity.get('comfy') == current_identity.get('comfy'):
-            rows.append(path)
+            rows.append(Path(plain(path)))
     return rows
 
 
 def torch_wheels(engine, pythons):
     """Downloaded PyTorch wheels, once every environment has exactly those versions installed."""
+    try:
+        engine = checked_real_path(engine)
+        pythons = [checked_real_path(path) for path in pythons]
+    except AliasUnavailable:
+        return []
+    engine = resolved_io(engine)
     if not windows():
         return []  # Other systems install PyTorch from the package cache.
     from .torch_download import catalog, installed_versions
-    directory = engine / 'downloads' / 'torch-wheels'
+    directory = io_path(engine) / 'downloads' / 'torch-wheels'
     if not pythons or not directory.is_dir() or not local_path(engine, directory):
         return []
     rows = catalog()
@@ -316,7 +386,7 @@ def torch_wheels(engine, pythons):
             except OSError:
                 continue
             if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-                found.append(path)
+                found.append(Path(plain(path)))
     return found
 
 
@@ -346,20 +416,13 @@ def shortcut_targets():
                         links.append(path)
             found |= {Path(target) for target in read_link_targets(links).values()}
         elif sys.platform == 'linux':
-            import shlex
+            from .desktop_shortcut import desktop_entry_target, linux_desktop_directory
             data = os.environ.get('XDG_DATA_HOME', '')
-            folders = [Path(data) if os.path.isabs(data) else Path.home() / '.local/share', Path.home()]
-            for path in [*(folders[0] / 'applications').glob('*.desktop'), *(folders[1] / 'Desktop').glob('*.desktop')]:
-                try:
-                    lines = path.read_text(encoding='utf-8', errors='replace').splitlines()
-                except OSError:
-                    continue
-                for line in lines:
-                    if line.startswith('Exec=') and 'FreeVideo' in line:
-                        try:
-                            found.add(Path(shlex.split(line[5:].replace('%%', '%'))[0]))
-                        except (ValueError, IndexError):
-                            continue
+            folders = [Path(data) if os.path.isabs(data) else Path.home() / '.local/share', linux_desktop_directory()]
+            for path in [*(folders[0] / 'applications').glob('*.desktop'), *folders[1].glob('*.desktop')]:
+                target = desktop_entry_target(path)
+                if target is not None:
+                    found.add(target)
         elif sys.platform == 'darwin':
             import plistlib
             from urllib.parse import unquote, urlsplit
@@ -391,7 +454,11 @@ def superseded(candidate, current):
 def approved_digests(launcher_root, current=None):
     """The approved update, and a found one the running launcher would still offer."""
     keep = set()
-    updates = Path(launcher_root) / 'updates'
+    try:
+        launcher_root = resolved_io(checked_real_path(launcher_root))
+    except AliasUnavailable:
+        return keep
+    updates = io_path(launcher_root) / 'updates'
     for name, read in (('active.json', lambda value: value['candidate']), ('available.json', lambda value: value)):
         try:
             found = read(json.loads((updates / name).read_text(encoding='utf-8')))
@@ -409,24 +476,36 @@ def approved_digests(launcher_root, current=None):
 def run(*, launcher_root=None, launcher_source=None, launcher_build=None, running=(), engine=None,
         comfy_root=None, engine_source=None, server_source=None, receipt=True):
     """Remove what the current launcher and installation no longer use; report what was freed."""
+    result = dict(released_bytes=0, download_bytes=0, removed=[], kept=[])
+    try:
+        launcher_root = checked_real_path(launcher_root) if launcher_root else None
+        engine = checked_real_path(engine) if engine else None
+        comfy_root = checked_real_path(comfy_root) if comfy_root else None
+    except AliasUnavailable:
+        result['kept'].append(dict(kind='installation', reason='invalid runtime alias'))
+        return result
+    launcher_root = resolved_io(launcher_root) if launcher_root else None
+    engine = resolved_io(engine) if engine else None
+    comfy_root = resolved_io(comfy_root) if comfy_root else None
     from .locking import runtime_lock
-    result = dict(released_bytes=0, removed=[], kept=[])
     snapshot = references()
+    engine = io_path(engine).absolute() if engine else None
 
     def drop(path, root, kind):
+        path = io_path(path)
         released = remove(path, root, snapshot)
         if not Path(path).exists():
             result['released_bytes'] += released
-            result['removed'].append(dict(kind=kind, path=str(path), bytes=released))
+            result['removed'].append(dict(kind=kind, path=plain(path), bytes=released))
         else:
-            result['kept'].append(dict(kind=kind, path=str(path), reason='in use'))
+            result['kept'].append(dict(kind=kind, path=plain(path), reason='in use'))
 
     running = [path for path in map(resolved, running) if path]
     linked = shortcut_targets()
     if linked is None:
         result['kept'].append(dict(kind='launcher-copies', reason='shortcuts unreadable'))
     if launcher_root:
-        launcher_root = Path(launcher_root).absolute()
+        launcher_root = io_path(launcher_root).absolute()
         keep = approved_digests(launcher_root, launcher_build) | {path.parent.name[:64] for path in [*running, *(linked or ())]}
         for path in downloads(launcher_root / 'updates', launcher_root, keep) if linked is not None else ():
             drop(path, launcher_root, 'launcher-update')
@@ -436,13 +515,26 @@ def run(*, launcher_root=None, launcher_source=None, launcher_build=None, runnin
             for path in sources(launcher_root / 'source', launcher_root, {launcher_source, *editable}, launcher_source):
                 drop(path, launcher_root, 'launcher-source')
         result['released_bytes'] += finish_retired(launcher_root / 'source', launcher_root, VERSION)
+        if linked is not None:
+            # Copies for installations too deep for a shortcut path (desktop_shortcut.copies_folder),
+            # shared by every installation: keep what any shortcut, running launcher or this
+            # installation's record starts, and the copy of a running launcher's own version.
+            keep = {path.parent for path in [*running, *linked]}
+            try:
+                keep.add(io_path(json.loads((io_path(engine) / 'launcher' / 'desktop-shortcut.json').read_text(encoding='utf-8'))['target']).parent)
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
+            versions = {path.parent.name[:64] for path in running}
+            for path in applications(launcher_root / 'application', launcher_root, keep):
+                if path.name[:64] not in versions:
+                    drop(path, launcher_root, 'launcher-copy')
+            result['released_bytes'] += finish_retired(launcher_root / 'application', launcher_root, DIGEST)
     if engine:
-        engine = Path(engine).absolute()
         receipt_source = None
         if comfy_root:
             try:
                 from .comfy_launcher_runtime import node_target
-                receipt_source = json.loads((node_target(comfy_root) / 'freevideo-launcher.json')
+                receipt_source = json.loads((io_path(node_target(comfy_root)) / 'freevideo-launcher.json')
                                             .read_text(encoding='utf-8')).get('source')
             except (OSError, ValueError, TypeError):
                 pass
@@ -458,7 +550,7 @@ def run(*, launcher_root=None, launcher_source=None, launcher_build=None, runnin
         except (OSError, ValueError, TypeError):
             target = None
         if target and linked is not None:
-            keep = {Path(target).parent, *(path.parent for path in [*running, *linked])}
+            keep = {io_path(target).parent, *(path.parent for path in [*running, *linked])}
             for folder in ('application', 'application.noindex'):
                 for path in applications(engine / 'launcher' / folder, engine, keep):
                     drop(path, engine, 'launcher-copy')
@@ -470,30 +562,40 @@ def run(*, launcher_root=None, launcher_source=None, launcher_build=None, runnin
                 pythons, current = [], None
                 try:
                     machine = json.loads((engine / 'machine.json').read_text(encoding='utf-8'))
-                    pythons.append(Path(machine['python']))
+                    pythons.append(io_path(machine['python']))
                 except (OSError, ValueError, KeyError, TypeError):
                     machine = None
                 try:
                     host = json.loads((engine / 'launcher' / 'comfy-host.json').read_text(encoding='utf-8'))
-                    current = Path(host['environment'])
-                    pythons.append(Path(host['python']))
+                    current = io_path(host['environment'])
+                    pythons.append(io_path(host['python']))
                 except (OSError, ValueError, KeyError, TypeError):
                     pass
                 if current is not None and current.is_dir() and local_path(engine, current):
                     for path in environments(engine, current):
                         drop(path, engine, 'comfyui-environment')
                     result['released_bytes'] += finish_retired(engine / 'envs', engine, ENVIRONMENT)
+                # Offline package extractions and download leftovers that duplicate verified model files.
+                from .package_cleanup import run as package_leftovers
+                leftovers = package_leftovers(engine, comfy_root, running=snapshot)
+                result['released_bytes'] += leftovers['released_bytes']
+                result['removed'] += leftovers['removed']
+                result['kept'] += leftovers['kept']
+                result['copied_model_bytes'] = leftovers['copied_model_bytes']
+                result['copied_model_reason'] = leftovers['copied_model_reason']
                 if machine and machine.get('ready') is True and all(python.is_file() for python in pythons):
                     for path in torch_wheels(engine, pythons):
+                        path = io_path(path)
                         try:
                             size = path.stat().st_size
                             path.unlink()
                             result['released_bytes'] += size
-                            result['removed'].append(dict(kind='torch-wheel', path=str(path), bytes=size))
+                            result['download_bytes'] += size
+                            result['removed'].append(dict(kind='torch-wheel', path=plain(path), bytes=size))
                         except OSError:
-                            result['kept'].append(dict(kind='torch-wheel', path=str(path), reason='in use'))
+                            result['kept'].append(dict(kind='torch-wheel', path=plain(path), reason='in use'))
         except OSError as error:  # Includes BlockingIOError: an installation holds the lease.
             result['kept'].append(dict(kind='installation', reason=type(error).__name__))
         if receipt and result['removed']:
             save(engine / 'logs' / ('cleanup-' + time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '.json'), result)
-    return result
+    return plain_data(result)

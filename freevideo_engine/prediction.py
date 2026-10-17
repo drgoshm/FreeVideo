@@ -84,6 +84,8 @@ def _canvas(value, options, text_tokens=None):
     canvas['task'] = options['engine']['task']
     if value.get('sampling_plan', {}).get('enabled') or value.get('sampling_plan', {}).get('version') == 2:
         canvas['sampling_plan'] = value['sampling_plan']
+    if 'early_reference' in value:
+        canvas['early_reference'] = value['early_reference']
     if type(canvas['steps']) is not int or canvas['steps'] <= 0:
         raise ValueError('Forecast steps must be a positive integer')
     from .media_request import TASKS
@@ -446,7 +448,7 @@ def predict(observations, identity, profile, geometry, *, text_tokens=None, exec
                 reject('missing_observed_geometry')
                 continue
             if any(key in original and key in enriched and original[key] != enriched[key]
-                   for key in ('width', 'height', 'frames', 'steps', 'task', 'reference_video_tokens', 'reference_audio_tokens')):
+                   for key in ('width', 'height', 'frames', 'steps', 'task', 'reference_video_tokens', 'reference_audio_tokens', 'early_reference')):
                 reject('inconsistent_observed_geometry')
                 continue
             canvas = _canvas(enriched, options, observation.get('text_tokens'))

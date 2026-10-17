@@ -22,6 +22,10 @@ GiB = 1 << 30
 MiB = 1 << 20
 MIN_SDK_BYTES = 64 * MiB
 STALL_SECONDS = 240
+# Bytes stopped while downloading move to another source after this long; the
+# longer allowance stays for connecting, the xet start-up and verification.
+DOWNLOAD_STALL_SECONDS = 30
+CONNECT_STALL_SECONDS = 90
 SAME_SOURCE_ATTEMPTS = 3
 
 
@@ -135,10 +139,11 @@ class Progress:
                 self.last = now
 
 
-def verify(path, row):
+def verify(path, row, progress=None):
     if path.stat().st_size != row['bytes']:
         raise ValueError('Downloaded size differs from the pinned manifest')
-    return network.hash_file(path, 'sha256' if row.get('sha256') else 'sha1', not row.get('sha256'), discard_cache=True) == (row.get('sha256') or row['git_blob'])
+    return network.hash_file(path, 'sha256' if row.get('sha256') else 'sha1', not row.get('sha256'),
+                             discard_cache=True, progress=progress) == (row.get('sha256') or row['git_blob'])
 
 
 def checked_range_response(response, requested, total, progress):
@@ -187,10 +192,13 @@ def sdk_worker(request):
     progress = Progress(row['bytes'])
     backend = []
     started = time.monotonic()
+    from .install_activity import byte_progress
+    verifying = byte_progress('verify_progress', target,
+        report=lambda **row: emit(phase='verify', **row))
     try:
         if target.is_file():
-            emit(phase='verify')
-            if verify(target, row):
+            emit(phase='verify', done_bytes=0, total_bytes=row['bytes'])
+            if verify(target, row, progress=verifying):
                 emit(phase='ready', backend='verified-stage', seconds=time.monotonic()-started, fingerprint=fingerprint(target))
                 return 0
             network.retain_partial(target, 'hash-rejected')
@@ -213,7 +221,14 @@ def sdk_worker(request):
                 def update(self, amount):
                     progress.update(0)
                 def end(self):
-                    emit(phase='reconstruct', done_bytes=row['bytes'], total_bytes=row['bytes'])
+                    emit(phase='reconstruct', done_bytes=0, total_bytes=row['bytes'])
+                def merge_progress(self, done, total):
+                    merging(done, total)
+                def verify_progress(self, done, total):
+                    verifying(done, total)
+
+            merging = byte_progress('assemble_progress', target,
+                report=lambda **row: emit(phase='reconstruct', **row))
 
             original_get, original_parallel = _download.requests.get, getattr(_download, '_parallel_download', None)
 
@@ -318,8 +333,8 @@ def sdk_worker(request):
         # count alone does not prove that the file descriptor is closed.
         emit(phase='transfer_complete', done_bytes=row['bytes'], total_bytes=row['bytes'])
         downloaded = time.monotonic()
-        emit(phase='verify')
-        if not verify(target, row):
+        emit(phase='verify', done_bytes=0, total_bytes=row['bytes'])
+        if not verify(target, row, progress=verifying):
             raise ValueError('Downloaded hash differs from the pinned manifest')
         emit(phase='ready', backend=backend[-1] if backend else 'hf-cache',
              download_seconds=downloaded-started, verification_seconds=time.monotonic()-downloaded,
@@ -471,6 +486,14 @@ def run_sdk(source, row, path, plan, progress_callback, networking, transfer_com
         prior_phase = None
         prior_backend = None
         prior_io = 0
+        compare = dict(thread=None, rates={}, checks=0, at=None, current=0.)
+        moving = None
+        alternatives = []
+        if (row['bytes'] >= 128 * MiB and not networking.get('manual_source_switch') and not request['require_xet']
+                and not plan.get('manual_ranges')):
+            family = network.model_family(row)
+            alternatives = [(name, url, network.route_order(networking, family, name)[0])
+                            for name, url in network.model_urls(networking, row) if name != source]
         while process.poll() is None:
             if networking.get('resource_check'):
                 networking['resource_check']()
@@ -491,10 +514,29 @@ def run_sdk(source, row, path, plan, progress_callback, networking, transfer_com
                 break
             # Xet reconstruction can lag network transfer; either counter counts
             # as activity. Verification gets a size-aware disk allowance.
-            timeout = max(STALL_SECONDS, row['bytes'] / (8*MiB)) if current['phase'] in ('verify', 'reconstruct') else STALL_SECONDS
+            timeout = (max(STALL_SECONDS, row['bytes'] / (8*MiB)) if current['phase'] in ('verify', 'reconstruct')
+                       else DOWNLOAD_STALL_SECONDS if current['phase'] == 'download' and current.get('done_bytes')
+                       else CONNECT_STALL_SECONDS)
             if time.monotonic() - current['last_activity'] > timeout:
                 failure = 'stalled-transfer'
                 break
+            if alternatives and current['phase'] == 'download' and current.get('done_bytes'):
+                if moving is None:
+                    moving = (time.monotonic(), current['done_bytes'])
+                    compare['at'] = moving[0] + network.SWITCH_AFTER_SECONDS
+                from .provision import model_headers
+                better = network._faster_source(compare, time.monotonic(), moving[0], moving[1], current['done_bytes'],
+                                                row['bytes'], alternatives, 5, None, networking,
+                                                network.model_family(row), model_headers, full_restart=True)
+                if better is not None:
+                    from .download_settings import current as settings, SwitchRequested
+                    failure = 'faster-source'
+                    network.event(networking, category=network.model_family(row), source=source,
+                                  file=path.name, action='fallback', reason='faster-source',
+                                  resume_bytes=current['done_bytes'])
+                    network.source_health(networking, network.model_family(row), source, False)
+                    network.source_health(networking, network.model_family(row), better[0], True)
+                    raise SwitchRequested(dict(settings(networking), source=better[0], automatic=True))
             size_error = stage_overflow(stage, row, selected['part_bytes'])
             if size_error:
                 failure = 'unexpected-transfer-size'
@@ -507,7 +549,9 @@ def run_sdk(source, row, path, plan, progress_callback, networking, transfer_com
                                   file=path.name, action='backend', method=current['backend'])
                     prior_backend = current['backend']
                 if current['phase'] == 'verify' and prior_phase != 'verify':
-                    sys.stdout.write(json.dumps(dict(event='verify_model', file=str(path), bytes=row['bytes'])) + '\n')
+                    from .model_status import NAMES, family
+                    sys.stdout.write(json.dumps(dict(event='verify_model', file=str(path), bytes=row['bytes'],
+                                                     name=NAMES[family(row)][0])) + '\n')
                     sys.stdout.flush()
                 elif current['phase'] == 'reconstruct' and prior_phase != 'reconstruct':
                     sys.stdout.write(json.dumps(dict(event='assemble_model', file=str(path), bytes=row['bytes'])) + '\n')
@@ -522,6 +566,12 @@ def run_sdk(source, row, path, plan, progress_callback, networking, transfer_com
                         network_bytes_per_second=current.get('transfer_bytes', 0) /
                         max(.001, current.get('elapsed_seconds', time.monotonic()-started)),
                         method=current.get('backend'))
+                if current['phase'] in ('verify', 'reconstruct') and current.get('total_bytes'):
+                    from .model_status import NAMES, family
+                    sys.stdout.write(json.dumps(dict(event='verify_progress' if current['phase'] == 'verify' else 'assemble_progress',
+                        file=str(path), name=NAMES[family(row)][0], done_bytes=current.get('done_bytes', 0),
+                        total_bytes=current['total_bytes'])) + '\n')
+                    sys.stdout.flush()
                 prior_phase = current['phase']
                 last_emit = time.monotonic()
             # The SDK reports the transfer complete before it starts its final
@@ -664,7 +714,8 @@ def download(row, path, plan, progress_callback, headers_for, *, transfer_comple
                     network.event(networking,category=network.model_family(row),source=selected,
                         file=path.name,action='manual-switch',resume_bytes=retained['bytes'],
                         retained_unmapped_bytes=retained.get('unmapped_bytes',0),
-                        reason='User selected a new source; stopped the previous worker')
+                        reason=('A faster source was found; stopped the slower transfer' if switch.value.get('automatic')
+                                else 'User selected a new source; stopped the previous worker'))
                     if path.is_file() and retained['bytes']==row['bytes']:
                         break
     finally:

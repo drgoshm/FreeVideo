@@ -5,7 +5,8 @@ function Invoke-FreeVideoBootstrapCommand {
         [Parameter(Mandatory=$true)][string[]]$Arguments,
         [Parameter(Mandatory=$true)][string]$LogPath,
         [Parameter(Mandatory=$true)][string]$Label,
-        [switch]$Direct
+        [switch]$Direct,
+        [ref]$OutputTail
     )
     # Windows PowerShell 5.1 turns redirected native stderr into ErrorRecords.
     # uv writes normal progress there. Let the child finish and inspect its
@@ -24,6 +25,7 @@ function Invoke-FreeVideoBootstrapCommand {
     $log = [IO.StreamWriter]::new($LogPath, $true, $encoding)
     $log.AutoFlush = $true
     $previousExitCode = $global:LASTEXITCODE
+    $tail = [Collections.Generic.Queue[string]]::new()
     $savedProxy = @{}
     if ($Direct) {
         foreach ($name in @('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'NO_PROXY')) {
@@ -37,7 +39,14 @@ function Invoke-FreeVideoBootstrapCommand {
         # LASTEXITCODE would shadow their result and keep a stale/null value.
         $global:LASTEXITCODE = $null
         $log.WriteLine(('[{0}] {1}' -f [DateTime]::UtcNow.ToString('o'), $Label))
-        & $Executable @Arguments 2>&1 | ForEach-Object { $log.WriteLine($_.ToString()) }
+        & $Executable @Arguments 2>&1 | ForEach-Object {
+            $line = $_.ToString()
+            $log.WriteLine($line)
+            if ($OutputTail) {
+                $tail.Enqueue($line.Substring([Math]::Max(0, $line.Length - 4096)))
+                if ($tail.Count -gt 12) { [void]$tail.Dequeue() }
+            }
+        }
         $nativeExit = $global:LASTEXITCODE
         if ($null -eq $nativeExit) { throw "Native command did not return an exit code: $Executable" }
         $log.WriteLine("Exit code: $nativeExit")
@@ -46,12 +55,23 @@ function Invoke-FreeVideoBootstrapCommand {
         $log.WriteLine('Invocation failed: ' + $_.Exception.Message)
         throw
     } finally {
+        if ($OutputTail) { $OutputTail.Value = ($tail.ToArray() -join "`n") }
         foreach ($name in $savedProxy.Keys) {
             [Environment]::SetEnvironmentVariable($name, $savedProxy[$name], 'Process')
         }
         $global:LASTEXITCODE = $previousExitCode
         $log.Dispose()
     }
+}
+
+function Test-FreeVideoSlowDownloadFailure {
+    param([string]$Detail)
+    # Keep the patient-round gate aligned with network.slow_download_failure.
+    # URL paths may contain validation words without a validation failure.
+    $Detail = $Detail -replace 'https?://\S+', ''
+    return ($Detail -match 'timed out|timeout|connection|could not resolve|failed to download|failed to fetch|network is unreachable|ssl|tls|http status|status code|requested url returned error|rpc failed|early eof|unable to access|remote end hung up|couldn''t connect|proxy' -and
+        $Detail -notmatch '\b(401|403|404|410)\b' -and
+        $Detail -notmatch 'no solution found|no matching distribution|could not find a version|\b(?:invalid|bad|wrong|incorrect|mismatched?)\s+checksums?\b|\bchecksums?\s+(?:mismatch|error|failed|failure)\b|\bchecksums?\s+(?:verification|validation)\s+(?:failed|failure|error)\b|\bchecksums?\s+(?:does\s+not|doesn''t|did\s+not|didn''t|do\s+not|don''t)\s+match\b|\b(?:does\s+not|doesn''t|did\s+not|didn''t|do\s+not|don''t)\s+match\s+(?:the\s+|its\s+|expected\s+)?(?:checksums?|hash(?:es)?)\b|\bhash\s+(?:mismatch|check\s+failed|does\s+not\s+match)\b|\bhashes\s+(?:do\s+not|didn''t)\s+match\b|\bsha-?256\s+mismatch\b|\bdigest\s+mismatch\b|\bintegrity\s+(?:check|verification)\s+failed\b|certificate verify failed|certificate_verify_failed|invalid peer certificate|unknown issuer|not found|resolutionimpossible|failed to build|invalid wheel|permission denied|no space left on device|disk full')
 }
 
 function Test-FreeVideoUvArchive {

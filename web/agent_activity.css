@@ -1,0 +1,49 @@
+/* Agent activity: a quiet header pill, and a sheet listing the agents' jobs. */
+.fv-studio .fv-agent-pill,.fv-agent-pill{min-height:0;display:inline-flex;align-items:center;gap:8px;height:var(--fv-h-sm);padding:0 12px 0 10px;border:1px solid var(--fv-border);border-radius:999px;background:var(--fv-card);color:var(--fv-ink);font:inherit;font-size:var(--fv-micro);font-weight:var(--fv-medium);white-space:nowrap;cursor:pointer;transition:background var(--fv-quick) var(--fv-ease),border-color var(--fv-quick) var(--fv-ease)}
+.fv-studio .fv-agent-pill:hover{background:var(--fv-hover);border-color:var(--fv-sheen)}
+.fv-studio .fv-agent-pill[aria-expanded=true]{background:var(--fv-selected);border-color:var(--fv-accent-dim)}
+.fv-agent-pill[hidden]{display:none}
+.fv-agent-dot{width:8px;height:8px;border-radius:50%;background:var(--fv-muted);flex:none}
+.fv-agent-pill[data-state=running] .fv-agent-dot{background:var(--fv-accent);box-shadow:0 0 0 0 color-mix(in srgb,var(--fv-accent) 60%,transparent);animation:fv-agent-pulse 1.6s var(--fv-ease-out) infinite}
+.fv-agent-pill[data-state=waiting] .fv-agent-dot{background:var(--fv-warning)}
+.fv-agent-pill[data-state=done] .fv-agent-dot{background:var(--fv-success)}
+.fv-agent-pill[data-state=failed] .fv-agent-dot{background:var(--fv-danger)}
+.fv-agent-label{font-variant-numeric:tabular-nums}
+@keyframes fv-agent-pulse{70%{box-shadow:0 0 0 7px transparent}100%{box-shadow:0 0 0 0 transparent}}
+@media (prefers-reduced-motion:reduce){.fv-agent-pill[data-state=running] .fv-agent-dot{animation:none}}
+
+.fv-agent-panel{position:absolute;z-index:20;top:72px;right:24px;width:min(400px,calc(100% - 32px));max-height:min(560px,calc(100% - 96px));display:flex;flex-direction:column;background:var(--fv-raised);border:1px solid var(--fv-border);border-radius:var(--fv-r-md);box-shadow:0 18px 48px rgb(0 0 0/.45);color:var(--fv-ink);overflow:hidden;animation:fv-agent-in var(--fv-base) var(--fv-ease-out)}
+.fv-agent-panel[hidden]{display:none}
+@keyframes fv-agent-in{from{opacity:0;transform:translateY(-6px)}}
+.fv-agent-panel header{padding:16px 18px 12px;border-bottom:1px solid var(--fv-border)}
+.fv-agent-panel h2{margin:0;font-size:var(--fv-strong);font-weight:var(--fv-semibold)}
+.fv-agent-panel ol{list-style:none;margin:0;padding:6px;overflow:auto;display:grid;gap:2px}
+.fv-agent-job{display:grid;grid-template-columns:20px minmax(0,1fr);gap:12px;padding:12px;border-radius:var(--fv-r-sm)}
+.fv-agent-job:hover{background:var(--fv-hover)}
+.fv-agent-glyph{width:20px;height:20px;margin-top:1px;fill:none;stroke:var(--fv-muted);stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round}
+.fv-agent-job[data-status=running] .fv-agent-glyph{stroke:var(--fv-accent)}
+.fv-agent-job[data-status=succeeded] .fv-agent-glyph{stroke:var(--fv-success)}
+.fv-agent-job[data-status=failed] .fv-agent-glyph{stroke:var(--fv-danger)}
+.fv-agent-body{min-width:0;display:grid;gap:7px}
+.fv-agent-head{display:flex;align-items:baseline;justify-content:space-between;gap:12px}
+.fv-agent-head strong{font-size:var(--fv-body);font-weight:var(--fv-medium);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fv-agent-state{flex:none;font-size:var(--fv-micro);color:var(--fv-muted)}
+.fv-agent-job[data-status=running] .fv-agent-state{color:var(--fv-accent)}
+.fv-agent-job[data-status=succeeded] .fv-agent-state{color:var(--fv-success)}
+.fv-agent-job[data-status=failed] .fv-agent-state{color:var(--fv-danger)}
+.fv-agent-bar{height:4px;border-radius:2px;background:var(--fv-border);overflow:hidden}
+.fv-agent-bar i{display:block;height:100%;background:linear-gradient(90deg,var(--fv-accent),var(--fv-accent-ramp));transform-origin:left;transition:transform var(--fv-slow) var(--fv-ease)}
+.fv-agent-foot{display:flex;align-items:center;gap:6px}
+.fv-agent-meta{flex:1;min-width:0;margin:0;font-size:var(--fv-micro);line-height:1.45;color:var(--fv-muted);overflow-wrap:anywhere}
+.fv-studio .fv-agent-foot :is(button,a),.fv-agent-foot :is(button,a){min-height:0;flex:none;display:inline-flex;align-items:center;height:24px;padding:0 9px;border-radius:var(--fv-r-sm);border:1px solid var(--fv-border);background:transparent;color:var(--fv-ink);font:inherit;font-size:var(--fv-micro);text-decoration:none;cursor:pointer}
+.fv-studio .fv-agent-foot :is(button,a):hover{background:var(--fv-hover)}
+.fv-studio .fv-agent-stop:hover{border-color:var(--fv-danger);color:var(--fv-danger)}
+.fv-agent-foot button:disabled{opacity:.5;cursor:default}
+.fv-agent-divider{padding:12px 12px 4px;font-size:var(--fv-micro);color:var(--fv-disabled);letter-spacing:.02em}
+@media(max-width:680px){.fv-agent-pill{padding:0 9px 0 8px}.fv-agent-panel{right:16px;top:64px}}
+/* The pill shares the header with the centred view switch. Below 1050px it keeps only "Agent" and the percentage;
+   below 820px the switch takes its own row while the pill shows, as it already does below 480px. */
+@media(max-width:1050px){.fv-agent-pill :is(.fv-agent-state-text,.fv-agent-more){display:none}}
+@media(max-width:820px){.fv-studio .fv-header:has(>.fv-view-switch):has(.fv-agent-pill:not([hidden])){height:auto;min-height:98px;grid-template-columns:1fr auto;padding-block:10px}.fv-studio .fv-header:has(.fv-agent-pill:not([hidden]))>.fv-view-switch{grid-column:1/-1;grid-row:2;justify-self:center}.fv-studio .fv-header:has(.fv-agent-pill:not([hidden]))>.fv-header-actions{grid-column:2;grid-row:1}}
+@media(max-width:480px){.fv-agent-panel{top:104px;left:16px;right:16px;width:auto}}
+.fv-agent-panel:focus{outline:none}

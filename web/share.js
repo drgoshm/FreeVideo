@@ -1,6 +1,9 @@
 import {api} from '../../scripts/api.js';
 import {closeDialog} from './motion.js';
-import {effortFor, effortName} from './sampling_effort.js';
+import {SAMPLING_EFFORTS_MAC, effortFor, effortName} from './sampling_effort.js';
+import {fontCSS as bundledFontCSS, fontLoaded, loadFont} from './fonts.js';
+import {shareLayout} from './share_layout.js';
+import {videoUnavailableText} from './studio_extend.js';
 
 const css=document.createElement('link'); css.rel='stylesheet'; css.href=new URL('./share.css',import.meta.url).href; document.head.append(css);
 const el=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text)e.textContent=text;return e;};
@@ -25,13 +28,9 @@ async function withGraph(blob,graph){
 const tint=(hex,alpha)=>{const v=parseInt(hex.slice(1),16);return `rgba(${v>>16},${v>>8&255},${v&255},${alpha})`;};
 let opened;
 
-// Deterministic Canvas rendering: browser fonts cover CJK and no external
-// resources or user prompt are included. The image window preserves every pixel.
-export function shareLayout(width,height) {
-    const w=width>=height?1200:900, scale=w/width, footer=w>=1000?148:200;
-    const h=Math.round(Math.min(1800,height*scale)/2)*2, artWidth=Math.round(h*width/height/2)*2;
-    return {width:w,height:h+footer,rect:[Math.floor((w-artWidth)/2),0,artWidth,h],footer};
-}
+// Prefer bundled sans, but keep the card usable when optional font files are blocked.
+export const shareFonts=()=>Promise.all([loadFont('sans',400),loadFont('sans',700)]).catch(error=>console.warn('FreeVideo share fonts unavailable; using fallback fonts.',error));
+const fontCSS=(name,weight,size)=>{const css=bundledFontCSS(name,weight,size);return fontLoaded(name,weight)?css:css.replace('"FreeVideo Box"','sans-serif');};
 
 export function drawShareCard(canvas,frame,logo,record,t) {
     const g=record.geometry||{}, shape=shareLayout(g.width||frame?.naturalWidth||1344,g.height||frame?.naturalHeight||768);
@@ -39,7 +38,9 @@ export function drawShareCard(canvas,frame,logo,record,t) {
     const ctx=canvas.getContext('2d'),w=shape.width,y=shape.rect[3],H=shape.footer,pad=44,wide=w>=1000;
     const p=record.sampling_plan||{},steps=p.base_steps,refine=p.enabled?p.refine_steps:0;
     // Results made with the earlier 8 + 2 default count as Light.
-    const tier=effortFor(steps,!!p.enabled,p.enabled&&steps===8&&refine===2?3:refine), accent=tier?.color||'#8fa3bb';
+    // A Mac result names its level from the Mac table (High 16 steps, Max 20 without a cache).
+    const plan=[steps,!!p.enabled,p.enabled&&steps===8&&refine===2?3:refine,p.step_cache??null];
+    const tier=effortFor(...plan)||effortFor(...plan,SAMPLING_EFFORTS_MAC), accent=tier?.color||'#8fa3bb';
     ctx.fillStyle='#0b1016';ctx.fillRect(0,0,w,shape.height);ctx.clearRect(...shape.rect);
     const bg=ctx.createLinearGradient(0,y,0,y+H);bg.addColorStop(0,'#131b26');bg.addColorStop(1,'#0b1016');
     ctx.fillStyle=bg;ctx.fillRect(0,y,w,H);
@@ -48,12 +49,11 @@ export function drawShareCard(canvas,frame,logo,record,t) {
     const line=ctx.createLinearGradient(0,0,w,0);line.addColorStop(0,tint(accent,0));line.addColorStop(.5,tint(accent,.75));line.addColorStop(1,tint(accent,0));
     ctx.fillStyle=line;ctx.fillRect(0,y,w,2);
     if(frame)ctx.drawImage(frame,...shape.rect);
-    const font='"Segoe UI", "PingFang SC", "Microsoft YaHei", system-ui, sans-serif';
-    const fit=(text,weight,size,max)=>{while(size>12){ctx.font=`${weight} ${size}px ${font}`;if(ctx.measureText(text).width<=max)break;size--;}return ctx.measureText(text).width;};
+    const fit=(text,weight,size,max)=>{while(size>12){ctx.font=fontCSS('sans',weight,size);if(ctx.measureText(text).width<=max)break;size--;}return ctx.measureText(text).width;};
     const logoWidth=wide?156:140, logoTop=wide?y+H/2-26:y+30;
-    ctx.drawImage(logo,pad,logoTop,logoWidth,logoWidth*337/2016);
+    if(logo)ctx.drawImage(logo,pad,logoTop,logoWidth,logoWidth*337/2016);
     const seconds=g.seconds||g.frames/(g.fps||24);
-    ctx.font=`400 14px ${font}`;ctx.fillStyle='#6f8399';ctx.textAlign=wide?'left':'right';
+    ctx.font=fontCSS('sans',400,14);ctx.fillStyle='#6f8399';ctx.textAlign=wide?'left':'right';
     ctx.fillText(`${g.width} × ${g.height}${Number.isFinite(seconds)?' · '+seconds.toFixed(1)+' s':''}`,wide?pad:w-pad,wide?y+H/2+24:y+46);
     ctx.textAlign='left';
     const gpu=(record.gpu||t('GPU not recorded','显卡未记录')).replace(/^NVIDIA\s+/,'').replace(/GeForce\s+/,'');
@@ -61,7 +61,7 @@ export function drawShareCard(canvas,frame,logo,record,t) {
         [t('Quality','质量'),tier?effortName(t,tier):(steps?t('Custom','自定义'):'—'),true]];
     const labelY=wide?y+H/2-16:y+H-80, valueY=wide?y+H/2+26:y+H-38;
     const drawStat=([label,value,pill],x,max)=>{
-        ctx.font=`500 13px ${font}`;ctx.fillStyle='#7d90a6';ctx.fillText(label,x,labelY);
+        ctx.font=fontCSS('sans',500,13);ctx.fillStyle='#7d90a6';ctx.fillText(label,x,labelY);
         if(!pill){fit(value,600,28,max);ctx.fillStyle='#eef3fa';ctx.fillText(value,x,valueY);return;}
         const text=fit(value,650,20,max-32),pw=text+32;
         ctx.beginPath();ctx.roundRect(x,valueY-27,pw,34,17);ctx.fillStyle=tint(accent,.16);ctx.fill();
@@ -70,7 +70,7 @@ export function drawShareCard(canvas,frame,logo,record,t) {
     };
     if(wide){
         // Right-aligned columns; each takes its own width, separated by hairlines.
-        const widths=stats.map(([label,value,pill])=>{ctx.font=`500 13px ${font}`;const l=ctx.measureText(label).width;
+        const widths=stats.map(([label,value,pill])=>{ctx.font=fontCSS('sans',500,13);const l=ctx.measureText(label).width;
             const v=pill?Math.min(fit(value,650,20,220),220)+32:Math.min(fit(value,600,28,300),300);return Math.max(l,v);});
         let x=w-pad;
         for(let i=stats.length-1;i>=0;i--){
@@ -98,7 +98,7 @@ export async function openShare(record,t){
     const tabs=el('div','fv-share-tabs');tabs.setAttribute('role','tablist');
     const indicator=el('span','fv-share-indicator');indicator.setAttribute('aria-hidden','true');tabs.append(indicator);
     const slide=()=>{const b=tabs.querySelector('[aria-selected=true]');if(b)indicator.style.cssText=`transform:translateX(${b.offsetLeft-3}px);width:${b.offsetWidth}px`;};
-    let kind='image',ready=false,busy=false,disposed=false,metadata,shape,template,first,logo,exported;
+    let kind='image',ready=false,busy=false,disposed=false,videoFailed=false,metadata,shape,template,first,logo,exported;
     let exportRequest;
     const abort=new AbortController();
     const panel=el('div','fv-share-body'),preview=el('div','fv-share-preview'),canvas=el('canvas'),player=el('video');
@@ -111,16 +111,25 @@ export async function openShare(record,t){
     const save=button(t('Save image','保存分享图'),download,'fv-primary');save.disabled=true;
     const cancel=button(t('Cancel','取消'),()=>exportRequest?.abort());cancel.hidden=true;
     footer.append(message,cancel,save);heading.append(title,tabs,close);dialog.append(heading,panel,footer);
+    const videoError=()=>{
+        if(disposed)return;
+        videoFailed=true;
+        if(kind==='video'&&!busy){message.textContent=videoUnavailableText(t);dialog.dataset.error='true';}
+    };
+    player.addEventListener('error',videoError);
     const choose=next=>{
+        if(busy)return;
         kind=next;tabs.querySelectorAll('button').forEach(b=>{
             b.setAttribute('aria-selected',String(b.dataset.kind===kind));b.tabIndex=b.dataset.kind===kind?0:-1;
         });
         save.textContent=kind==='image'?t('Save image','保存分享图'):t('Save video','保存分享视频');
         slide();
         if(!ready)return;
+        message.textContent=kind==='video'&&videoFailed?videoUnavailableText(t):'';
+        if(kind==='video'&&videoFailed)dialog.dataset.error='true';else delete dialog.dataset.error;
         drawShareCard(canvas,kind==='image'?first:null,logo,metadata,t);
         player.hidden=kind!=='video';
-        if(kind==='video')player.play().catch(()=>{});else player.pause();
+        if(kind==='video')player.play().catch(error=>{if(!['AbortError','NotAllowedError'].includes(error.name))videoError();});else player.pause();
     };
     for(const [name,label] of [['image',t('Image','图片')],['video',t('Video','视频')]]){
         const b=button(label,()=>choose(name));b.dataset.kind=name;b.setAttribute('role','tab');b.setAttribute('aria-selected',String(name===kind));b.tabIndex=name===kind?0:-1;tabs.append(b);
@@ -132,13 +141,22 @@ export async function openShare(record,t){
     };
     async function download(){
         if(!ready||busy)return;
-        if(kind==='image'){
-            canvas.toBlob(async blob=>{if(!blob||disposed)return;blob=await withGraph(blob,metadata?.graph);const url=URL.createObjectURL(blob);const a=el('a');a.href=url;a.download=`FreeVideo_share_${id.split('/')[1].slice(0,12)}.png`;a.click();setTimeout(()=>URL.revokeObjectURL(url),60000);},'image/png');return;
-        }
-        busy=true;save.disabled=true;cancel.hidden=false;tabs.querySelectorAll('button').forEach(b=>b.disabled=true);
-        message.textContent=t('Preparing sharing video…','正在导出分享视频…');dialog.dataset.busy='true';
+        busy=true;save.disabled=true;cancel.hidden=kind==='image';tabs.querySelectorAll('button').forEach(b=>b.disabled=true);
+        message.textContent=kind==='image'?t('Saving the share image…','正在保存分享图…'):t('Exporting the share video…','正在导出分享视频…');
+        dialog.dataset.busy='true';delete dialog.dataset.error;
         exportRequest=new AbortController();
         try{
+            if(kind==='image'){
+                let blob=await new Promise((resolve,reject)=>{
+                    canvas.toBlob(value=>value?resolve(value):reject(new Error('image_encoding_failed')),'image/png');
+                });
+                if(disposed)return;
+                blob=await withGraph(blob,metadata?.graph);
+                if(disposed)return;
+                const url=URL.createObjectURL(blob),a=el('a');
+                a.href=url;a.download=`FreeVideo_share_${id.split('/')[1].slice(0,12)}.png`;a.click();
+                setTimeout(()=>URL.revokeObjectURL(url),60000);message.textContent='';return;
+            }
             if(!exported){
                 const response=await api.fetchApi('/freevideo/share/video',{method:'POST',headers:{'Content-Type':'application/json'},signal:exportRequest.signal,
                     body:JSON.stringify({id,template,rect:shape.rect})});
@@ -148,7 +166,11 @@ export async function openShare(record,t){
             }
             if(disposed)return;
             const a=el('a');a.href=api.apiURL('/freevideo/share/video?'+new URLSearchParams(exported));a.download='';a.click();message.textContent='';
-        }catch(error){if(!disposed)message.textContent=error.name==='AbortError'?'':error.message;}
+        }catch(error){if(!disposed){
+            message.textContent=kind==='image'?t('Could not save the share image. Try again.','分享图没有保存成功，请重试。')
+                :error.name==='AbortError'?'':error.message;
+            if(message.textContent)dialog.dataset.error='true';
+        }}
         finally{busy=false;if(!disposed){save.disabled=false;cancel.hidden=true;delete dialog.dataset.busy;tabs.querySelectorAll('button').forEach(b=>b.disabled=false);}}
     }
     dialog.addEventListener('cancel',event=>{event.preventDefault();closeDialog(dialog);});
@@ -159,12 +181,12 @@ export async function openShare(record,t){
         const response=await api.fetchApi('/freevideo/share?'+new URLSearchParams({id}),{signal:abort.signal});
         if(!response.ok)throw new Error(t('This saved video is unavailable.','这个已保存的视频暂时无法读取。'));
         metadata=await response.json();
-        [first,logo]=await Promise.all([image(api.apiURL('/freevideo/share/frame?'+new URLSearchParams({id}))),image(new URL('./assets/freevideo.svg',import.meta.url).href)]);
+        [first,logo]=await Promise.all([image(api.apiURL('/freevideo/share/frame?'+new URLSearchParams({id}))),image(new URL('./assets/freevideo.svg',import.meta.url).href).catch(error=>{console.warn('FreeVideo share logo unavailable; continuing without it.',error);return null;})]);
         if(disposed)return;
-        if(document.fonts?.ready)await document.fonts.ready;
+        await shareFonts();if(document.fonts?.ready)await document.fonts.ready.catch(error=>console.warn('FreeVideo share fonts unavailable; using fallback fonts.',error));
         shape=drawShareCard(canvas,null,logo,metadata,t);template=canvas.toDataURL('image/png').split(',')[1];
         preview.style.aspectRatio=`${shape.width}/${shape.height}`;
         player.style.cssText=`left:${shape.rect[0]/shape.width*100}%;top:0;width:${shape.rect[2]/shape.width*100}%;height:${shape.rect[3]/shape.height*100}%`;
-        ready=true;choose(kind);save.disabled=false;message.textContent='';
+        ready=true;choose(kind);save.disabled=false;
     }catch(error){if(!disposed){message.textContent=error.message||t('Preview unavailable. Close and try again.','预览暂时无法读取，请关闭后重试。');dialog.dataset.error='true';}}
 }

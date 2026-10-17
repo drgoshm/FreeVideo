@@ -22,8 +22,8 @@ def validate_tail(base_steps, refine_steps):
 
 def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, num_steps,
                      seed, device, *, initial_latents, refine_steps, step_seconds=None,
-                     conditions=None, video_shift=12., audio_shift=3., refine_schedule=None):
-    from diffusers import MiniMaxH3Scheduler
+                     conditions=None, video_shift=12., audio_shift=3., refine_schedule=None, timestep_task=None):
+    from .step_grid import scheduler
     from diffusers.modular_pipelines.minimax_h3.before_denoise import (
         MiniMaxH3PrepareLayoutStep, MiniMaxH3Ref2VAPrepareLayoutStep, patchify_video_latents)
     from diffusers.modular_pipelines.minimax_h3.modular_pipeline import (
@@ -88,7 +88,7 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
         video_scheduler, audio_scheduler = schedulers(device)
         start = 1
     else:
-        video_scheduler, audio_scheduler = MiniMaxH3Scheduler(shift=video_shift), MiniMaxH3Scheduler(shift=audio_shift)
+        video_scheduler, audio_scheduler = scheduler(shift=video_shift), scheduler(shift=audio_shift)
         video_scheduler.set_timesteps(num_steps, device=device)
         audio_scheduler.set_timesteps(num_steps, device=device)
         start = num_steps - refine_steps
@@ -126,6 +126,10 @@ def generate_latents(transformer, prompt_embeds, text_token_tags, num_frames, nu
         row_times[audio_ids[audio_condition_rows:]] = float(audio_t)
         row_times[audio_ids[:audio_condition_rows]] = 1.
         times, time_ids = torch.unique(row_times, sorted=True, return_inverse=True)
+        if timestep_task is not None:
+            from .adaln import modality_timesteps
+            times = modality_timesteps(video_t[None], audio_t[None], timestep_task)[0]
+            time_ids = torch.searchsorted(times, row_times)
         prediction, _ = transformer(hidden_states=video_rows[None], audio_hidden_states=audio_rows[None],
             encoder_hidden_states=prompt_embeds[None], timestep=times, timestep_indices=time_ids,
             token_tags=tags, position_ids=positions, video_indices=video_ids, audio_indices=audio_ids,

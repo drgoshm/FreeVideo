@@ -1,6 +1,9 @@
 """Reopen immutable safetensor layer views only while filling an offload slot."""
 from contextlib import contextmanager
+import functools
 from pathlib import Path
+import threading
+import time
 
 
 _TORCH_DTYPES = {'BOOL': 'bool', 'U8': 'uint8', 'I8': 'int8', 'I16': 'int16',
@@ -65,6 +68,22 @@ def interleaved_layer_order(count):
             if lo < hi:
                 heapq.heappush(pending, (lo - hi, lo, hi))
     return order
+
+
+def spread_layer_order(count):
+    """Layers ordered so that any first part and any last part lie spread out.
+
+    Loading keeps streamed layers in RAM in this order until RAM runs out, so
+    the layers left on the drive are apart from each other wherever it stops,
+    and each can be read while the layers between them compute. Kept in index
+    order they were the last layers of the model, one after another, and the
+    drive stood idle through the rest of every step. Reversing the bits of
+    the index gives the order: 0, then the middle, then the quarters.
+    """
+    if type(count) is not int or count < 0:
+        raise ValueError('Layer count must be a non-negative integer')
+    bits = max(1, (count - 1).bit_length())
+    return sorted(range(count), key=lambda index: int(format(index, f'0{bits}b')[::-1], 2))
 
 
 def release_file_pages(paths):
@@ -232,6 +251,24 @@ class LayerReadAhead:
             self.cursor = 0
         self._fill()
 
+    def end_pass_early(self):
+        """Cancel the unread window and rewind without reading the skipped layers."""
+        self.stop.set()
+        for _, future in self.pending.values():
+            future.cancel()
+        for _, future in self.pending.values():
+            if not future.cancelled():
+                try:
+                    future.result()
+                except Exception as error:
+                    self.failed = self.failed or type(error).__name__ + ': ' + str(error)
+        self.pending.clear()
+        self.pending_bytes = 0
+        self.cursor = 0
+        if not self.failed and not self.closed:
+            self.stop.clear()
+        # before() will refill on demand; cached steps need no speculative I/O.
+
     def stats(self):
         with self.lock:
             return dict(self.counters, enabled=True, failure=self.failed,
@@ -251,6 +288,22 @@ class LayerReadAhead:
         self.pending_bytes = 0
 
 
+_READ_PIECE = 8 << 20
+_reader = None
+_reader_lock = threading.Lock()
+
+
+def _reader_pool():
+    """Threads shared by every streamed source's direct reads."""
+    global _reader
+    with _reader_lock:
+        if _reader is None:
+            from concurrent.futures import ThreadPoolExecutor
+            from .tensor_io import read_threads
+            _reader = ThreadPoolExecutor(read_threads(), thread_name_prefix='freevideo-stream-read')
+        return _reader
+
+
 # Streamed layers kept in RAM as read-only file views must leave this much
 # physical memory free. A 27.98 GiB Windows machine started sampling at
 # 7.31 GiB available and ran the refine pass at 6.98 GiB: 0.35 GiB of later
@@ -260,6 +313,74 @@ HOST_VIEW_RESERVE = int(2.5 * 2**30)
 # so a request that grows (a larger refine pass, readouts, another program)
 # trades them for disk reads instead of pushing Windows toward its floor.
 HOST_VIEW_SHED = int(1.5 * 2**30)
+# Direct reads of one step can exceed the memory left for the file cache. The
+# cache then holds the layers read last and the next step starts with the
+# first ones, so every layer comes from the drive again. Layers that fit beside
+# one passing layer and this slack are kept: read at normal page priority. The
+# rest are read at Windows' lowest page priority, whose pages the standby list
+# gives up first, to this request's next read or to any other program.
+CACHE_KEEP_SLACK = 512 * 2**20
+_MEMORY_PRIORITY_VERY_LOW = 1
+
+
+@functools.lru_cache(maxsize=None)
+def _thread_page_priority():
+    """Swap the calling thread's page priority on Windows: a function or None.
+
+    The function sets the given priority and returns the previous one, or
+    returns None and changes nothing when Windows refuses. It is None on other
+    systems, on Windows versions without SetThreadInformation and with
+    FREEVIDEO_PAGE_PRIORITY=off, where every read keeps normal priority.
+    """
+    import os
+    from .system import windows
+    if not windows() or os.environ.get('FREEVIDEO_PAGE_PRIORITY', 'auto').lower() in ('off', '0', 'false'):
+        return None
+    import ctypes
+    from ctypes import wintypes
+    try:
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        current, get, set_ = (kernel32.GetCurrentThread, kernel32.GetThreadInformation,
+                              kernel32.SetThreadInformation)
+    except (AttributeError, OSError):
+        return None
+    current.restype = wintypes.HANDLE
+    current.argtypes = ()
+    for function in (get, set_):
+        # THREAD_INFORMATION_CLASS ThreadMemoryPriority = 0, MEMORY_PRIORITY_INFORMATION.
+        function.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.POINTER(wintypes.ULONG), wintypes.DWORD)
+        function.restype = wintypes.BOOL
+
+    def swap(priority):
+        # A hint must never fail a read: any refusal leaves the priority as it was.
+        try:
+            info = wintypes.ULONG()
+            if not get(current(), 0, ctypes.byref(info), ctypes.sizeof(info)):
+                return None
+            previous = info.value
+            info.value = priority
+            return previous if set_(current(), 0, ctypes.byref(info), ctypes.sizeof(info)) else None
+        except (ctypes.ArgumentError, OSError, ValueError):
+            return None
+
+    # Setting this thread's own priority again proves the calls work here.
+    previous = swap(_MEMORY_PRIORITY_VERY_LOW)
+    if previous is None:
+        return None
+    swap(previous)
+    return swap
+
+
+@contextmanager
+def _low_page_priority(enabled):
+    """Read at the lowest page priority inside this block, on this thread only."""
+    swap = _thread_page_priority() if enabled else None
+    previous = swap(_MEMORY_PRIORITY_VERY_LOW) if swap is not None else None
+    try:
+        yield
+    finally:
+        if previous is not None:
+            swap(previous)
 
 
 def host_view_fits(size, reserve=HOST_VIEW_RESERVE):
@@ -295,6 +416,16 @@ class SafetensorLayers:
         self.host_view_hits = 0
         self.host_view_hit_bytes = 0
         self.host_view_released = 0
+        # Direct-read layers kept in the file cache between steps (index: bytes),
+        # and the direct reads of kept and passing layers.
+        self.cache_kept = {}
+        self.cache_kept_bytes = 0
+        self.cache_lock = threading.Lock()
+        self.read_stats = dict(kept_layers=0, kept_bytes=0, kept_seconds=0.,
+                               passed_layers=0, passed_bytes=0, passed_seconds=0.)
+        # A read from the drive has kept the inference thread waiting; the
+        # offloader then reads drive-backed layers further ahead (offload.py).
+        self.reads_delay_compute = False
         for path in sorted(set(Path(p).resolve() for p in paths)):
             self.files[path] = self.identity(path)
             with _open_safetensors(path, framework='np') as handle:
@@ -351,7 +482,6 @@ class SafetensorLayers:
         """
         if not self.direct_read or self.intermediate_dtype is not None:
             return False
-        import os
         import math
         import sys
         import torch
@@ -392,8 +522,9 @@ class SafetensorLayers:
             finally:
                 for path in reads:
                     self.check(path)
-            self.host_view_hits += 1
-            self.host_view_hit_bytes += size
+            with self.cache_lock:
+                self.host_view_hits += 1
+                self.host_view_hit_bytes += size
             del entry, views
             if not host_view_fits(0, HOST_VIEW_SHED):
                 self._release(index)
@@ -403,29 +534,172 @@ class SafetensorLayers:
         buffers = {dtype: memoryview(plane.detach().view(torch.uint8).numpy()).cast('B')
                    for dtype, plane in planes.items()}
         try:
+            pieces = []
             for path, entries in reads.items():
-                with path.open('rb', buffering=0) as stream:
-                    observed = _file_identity(os.fstat(stream.fileno()))
-                    if observed != self.handle_files[path]:
-                        raise CheckpointChangedError(path, 'handle', self.handle_files[path], observed)
-                    for start, size, dtype, offset, _ in sorted(entries, key=lambda row: row[0]):
-                        stream.seek(start)
-                        begin = offset * planes[dtype].element_size()
-                        target = buffers[dtype][begin:begin + size]
-                        done = 0
-                        while done < size:
-                            count = stream.readinto(target[done:])
-                            if not count:
-                                raise ValueError('Incomplete streamed checkpoint: ' + str(path))
-                            done += count
+                for start, size, dtype, offset, _ in sorted(entries, key=lambda row: row[0]):
+                    begin = offset * planes[dtype].element_size()
+                    target = buffers[dtype][begin:begin + size]
+                    pieces += [(path, start + at, target[at:at + _READ_PIECE])
+                               for at in range(0, size, _READ_PIECE)]
+            size = sum(row[1] for entries in reads.values() for row in entries)
+            # A layer about to become a view stays in this process, at normal priority.
+            keep = self._keeps_cached(index, size) or (
+                self.host_views is not None and host_view_fits(size, self.host_view_reserve))
+            started = time.monotonic()
+            self._read_pieces(pieces, low_page_priority=not keep)
+            kind = 'kept' if keep else 'passed'
+            with self.cache_lock:
+                self.read_stats[kind + '_layers'] += 1
+                self.read_stats[kind + '_bytes'] += size
+                self.read_stats[kind + '_seconds'] += time.monotonic() - started
             if self.host_views is not None:
-                size = sum(row[1] for entries in reads.values() for row in entries)
                 if host_view_fits(size, self.host_view_reserve):
                     self._adopt(index, reads, size)
+                    if index in self.host_views:
+                        self._forget_cached(index)
         finally:
             for path in reads:
                 self.check(path)
         return True
+
+    def _keeps_cached(self, index, size):
+        """Whether this layer's direct read stays in the file cache for the next step.
+
+        A layer is kept while the kept layers, one passing layer and
+        CACHE_KEEP_SLACK fit in available memory, which counts cached pages.
+        A kept layer is given up only once the kept layers and the slack no
+        longer fit, one layer of hysteresis. Without page priority every read
+        is kept, as before.
+        """
+        if _thread_page_priority() is None:
+            return True
+        from .system import system_memory
+        memory = system_memory()
+        available = memory.get('physical_available_bytes') or memory['available_bytes']
+        with self.cache_lock:
+            if index in self.cache_kept:
+                if self.cache_kept_bytes + CACHE_KEEP_SLACK <= available:
+                    return True
+                self.cache_kept_bytes -= self.cache_kept.pop(index)
+                return False
+            if self.cache_kept_bytes + 2 * size + CACHE_KEEP_SLACK <= available:
+                self.cache_kept[index] = size
+                self.cache_kept_bytes += size
+                return True
+            return False
+
+    def _forget_cached(self, index):
+        with self.cache_lock:
+            if index in self.cache_kept:
+                self.cache_kept_bytes -= self.cache_kept.pop(index)
+
+    def _read_pieces(self, pieces, low_page_priority=False):
+        """Read (path, position, destination) pieces on a few handles at once.
+
+        One handle reading a streamed layer tensor by tensor leaves most of a
+        fast drive idle: 28 int8 layers (12.1 GB) read from an NVMe drive with
+        a cold cache at 2.66 GB/s that way and at 3.4-4.4 GB/s as 8 MiB pieces
+        on four handles. With 34 such layers read every step, 960x544 steps
+        took 4.4 s instead of 6.0-6.2 s, bit-identical (Linux, RTX PRO 6000).
+        Loading already reads its blocks like this (tensor_io.ParallelReads).
+        Each piece fills exactly its bytes of the slot, and every handle is
+        checked against the file it opened. FREEVIDEO_READ_THREADS=1 reads on
+        the calling thread alone. With low_page_priority every reader reads at
+        the lowest page priority and restores its own afterwards.
+        """
+        import os
+        from contextlib import ExitStack
+        from .tensor_io import read_threads
+        threads = min(read_threads(), len(pieces))
+        # A reader still running when this call leaves would write into a slot
+        # its caller may reuse. After a failure here a reader writes nothing
+        # more, and the call returns only once none is reading.
+        state = dict(stop=False, active=0)
+        idle = threading.Condition()
+
+        def read(group):
+            with idle:
+                if state['stop']:
+                    return
+                state['active'] += 1
+            try:
+                streams = {}
+                with ExitStack() as opened, _low_page_priority(low_page_priority):
+                    for path, position, target in group:
+                        if state['stop']:
+                            return
+                        stream = streams.get(path)
+                        if stream is None:
+                            stream = streams[path] = opened.enter_context(path.open('rb', buffering=0))
+                            observed = _file_identity(os.fstat(stream.fileno()))
+                            if observed != self.handle_files[path]:
+                                raise CheckpointChangedError(path, 'handle', self.handle_files[path], observed)
+                        stream.seek(position)
+                        done = 0
+                        while done < len(target):
+                            count = stream.readinto(target[done:])
+                            if not count:
+                                raise ValueError('Incomplete streamed checkpoint: ' + str(path))
+                            done += count
+            finally:
+                with idle:
+                    state['active'] -= 1
+                    idle.notify_all()
+
+        if threads < 2:
+            read(pieces)
+            return
+        # Neighbouring pieces go to different handles, so together the
+        # readers still move through each file from front to back.
+        from concurrent.futures import wait
+        futures = []
+        try:
+            for first in range(threads):
+                futures.append(_reader_pool().submit(read, pieces[first::threads]))
+            wait(futures)
+        except BaseException:
+            with idle:
+                state['stop'] = True
+                idle.wait_for(lambda: not state['active'])
+            raise
+        for future in futures:
+            future.result()
+
+    def layer_bytes(self, index):
+        """Checkpoint bytes of one layer by stored dtype, from the headers alone."""
+        prefix = self.prefixes[index]
+        sizes = {}
+        for key, (_, size, stored, _) in self.byte_ranges.items():
+            if key.startswith(prefix):
+                sizes[stored] = sizes.get(stored, 0) + size
+        return sizes
+
+    def placeholders(self, index, path):
+        """Tensors with one file's stored dtypes and shapes for a layer, read from nothing.
+
+        Model loading binds a streamed layer only to record its layout, then
+        drops the values. When the layer will be neither pinned nor kept as a
+        view, reading it first is wasted: the first step reads it again. With
+        the RAM of a 16 GB machine, 31 of 45 offloaded blocks (13.4 GB) were
+        such layers; on the RTX 5060 Ti test machine loading took 7.1 s instead
+        of 11.3 s, with identical output, and slower drives save far more.
+        Each placeholder is one element expanded to the checkpoint shape.
+        Return None for a dtype torch lacks.
+        """
+        import torch
+        prefix = self.prefixes[index]
+        path = Path(path).resolve()
+        tensors = {}
+        for key, owner in self.keys.items():
+            if owner != path or not key.startswith(prefix):
+                continue
+            _, _, stored, shape = self.byte_ranges[key]
+            dtype = getattr(torch, _TORCH_DTYPES.get(stored, ''), None)
+            if dtype is None:
+                return None
+            tensors[key] = (torch.empty((1,) * len(shape), dtype=dtype).expand(shape) if all(shape)
+                            else torch.empty(shape, dtype=dtype))
+        return tensors
 
     def adopt(self, index):
         """Keep a layer that loading just read as views, so its first pass reads no disk.
@@ -482,19 +756,21 @@ class SafetensorLayers:
         # streamed reads recycle the standby list.
         for source in views.values():
             source[::mmap.PAGESIZE].sum()
-        self.host_views[index] = (views, mappings, size)
-        self.host_view_bytes += size
+        with self.cache_lock:
+            self.host_views[index] = (views, mappings, size)
+            self.host_view_bytes += size
 
     def _release(self, index):
-        views, mappings, size = self.host_views.pop(index)
+        with self.cache_lock:
+            views, mappings, size = self.host_views.pop(index)
+            self.host_view_bytes -= size
+            self.host_view_released += 1
         del views
         for mapping in mappings:
             try:
                 mapping.close()
             except BufferError:
                 pass  # A tensor view is still referenced; the mapping closes when it is collected.
-        self.host_view_bytes -= size
-        self.host_view_released += 1
 
     def release_host_views(self):
         for index in list(self.host_views or ()):

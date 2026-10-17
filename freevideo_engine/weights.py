@@ -5,8 +5,10 @@ the derived per-block cache records its own identity, preparation time and hashe
 """
 import hashlib
 import json
+import logging
 from pathlib import Path
 import re
+import shutil
 import time
 
 from safetensors.torch import save_file
@@ -124,16 +126,26 @@ def prepare(base, checkpoint, cache_root):
     output, identity, key = cache_location(cache_root, 'vdn-bf16-', identity)
     output.mkdir(parents=True, exist_ok=True)
     marker = output / 'source.json'
+    invalid = None
     if marker.exists() and json.loads(marker.read_text(encoding='utf-8')) != identity:
-        raise ValueError('Prepared weight identity conflict: ' + str(output))
-    marker.write_text(json.dumps(identity, indent=2) + '\n', encoding='utf-8')
+        invalid = 'Prepared weight identity conflict: ' + str(output)
     manifest = output / 'manifest.json'
-    if manifest.exists():
+    if invalid is None and manifest.exists():
         record = json.loads(manifest.read_text(encoding='utf-8'))
         for item in record['groups']:
             path = output / item['file']
             if not path.is_file() or path.stat().st_size != item['bytes']:
-                raise ValueError('Prepared weight cache is incomplete: ' + str(path))
+                invalid = 'Prepared weight cache is incomplete: ' + str(path)
+                break
+    if invalid is not None:
+        root, resolved = cache_root.resolve(), output.resolve()
+        if resolved == root or not resolved.is_relative_to(root):
+            raise ValueError('Refusing to delete prepared weight cache outside cache root: ' + str(output))
+        logging.getLogger(__name__).warning('%s; rebuilding cache', invalid)
+        shutil.rmtree(output)
+        output.mkdir(parents=True, exist_ok=True)
+    marker.write_text(json.dumps(identity, indent=2) + '\n', encoding='utf-8')
+    if manifest.exists():
         print(json.dumps({'cache': str(output), 'reused': True}), flush=True)
         return output
     groups = {}

@@ -12,7 +12,7 @@ def first_pass_conditions(conditions, target, canvas):
     """
     from torch.nn import functional as F
     from .two_pass import plan
-    sampling = plan(target)
+    sampling = plan(target, staged=True)
     if any(canvas[key] != sampling['first'][key] for key in ('width', 'height', 'frames')):
         raise ValueError('Keyframe resize must match the planned first-pass canvas')
     anchors, latents = conditions

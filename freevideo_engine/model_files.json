@@ -5,7 +5,8 @@
     "file": "LICENSE",
     "bytes": 17604,
     "sha256": null,
-    "git_blob": "c389b45855337ccec8ddeb389f4fe902abcd0b19"
+    "git_blob": "c389b45855337ccec8ddeb389f4fe902abcd0b19",
+    "download_sha256": "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -13,7 +14,8 @@
     "file": "h3-base/LICENSE",
     "bytes": 17604,
     "sha256": null,
-    "git_blob": "c389b45855337ccec8ddeb389f4fe902abcd0b19"
+    "git_blob": "c389b45855337ccec8ddeb389f4fe902abcd0b19",
+    "download_sha256": "59b99642b95ea21630e311198ddbfffbfe05aadba0c2f5d884cbdf4efcc90f44"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -21,7 +23,8 @@
     "file": "h3-base/README.md",
     "bytes": 38391,
     "sha256": null,
-    "git_blob": "aa9bba6233ed8d0b486fb43e1a35b4fb5ede2a60"
+    "git_blob": "aa9bba6233ed8d0b486fb43e1a35b4fb5ede2a60",
+    "download_sha256": "89a98af9e91fcb54c46cbcb88f8b8aa7aaf3a461714dbf21d2d3ef4b39312ee3"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -29,7 +32,8 @@
     "file": "h3-base/audio_scheduler/scheduler_config.json",
     "bytes": 96,
     "sha256": null,
-    "git_blob": "28a3d4ed602d925031c7e5d6eeb07df8958ff0f1"
+    "git_blob": "28a3d4ed602d925031c7e5d6eeb07df8958ff0f1",
+    "download_sha256": "804780f7133477067bd6bbfbc02dc8b3cf9feeb400f97c08f5b1d5f6cbab3840"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -37,7 +41,8 @@
     "file": "h3-base/audio_vae/config.json",
     "bytes": 2271,
     "sha256": null,
-    "git_blob": "15df6fe0b288b260dca0f2aebf1cd81334d77e96"
+    "git_blob": "15df6fe0b288b260dca0f2aebf1cd81334d77e96",
+    "download_sha256": "9a3c645ff892b376c6f5f4c8685964cd75474731af594ff058492a0000caabb6"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -53,7 +58,8 @@
     "file": "h3-base/model_index.json",
     "bytes": 2936,
     "sha256": null,
-    "git_blob": "454be19164878173a962c39c81633e4377880fca"
+    "git_blob": "454be19164878173a962c39c81633e4377880fca",
+    "download_sha256": "5a587fe13b2371427415ac892463142683aefcd8d322e274a3a095eac37ac7d2"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -61,7 +67,8 @@
     "file": "h3-base/modular_model_index.json",
     "bytes": 2935,
     "sha256": null,
-    "git_blob": "5b69f1e801bd0a7e9733c48704c732339f2002fe"
+    "git_blob": "5b69f1e801bd0a7e9733c48704c732339f2002fe",
+    "download_sha256": "a2b6a210e482ffb78e613b553f570c44e101afce6741bd4ed91429d0559af031"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -69,7 +76,8 @@
     "file": "h3-base/scheduler/scheduler_config.json",
     "bytes": 97,
     "sha256": null,
-    "git_blob": "1d44f95b955a648ad4fab455e4fe11053888c30b"
+    "git_blob": "1d44f95b955a648ad4fab455e4fe11053888c30b",
+    "download_sha256": "8fa6c3aa70dc9e691e1a6df899fd1b6f75f70481a27cee6e18a303817075c304"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -77,7 +85,8 @@
     "file": "h3-base/transformer/config.json",
     "bytes": 546,
     "sha256": null,
-    "git_blob": "c251a4133c81852a150c6668a570e142dc776b6e"
+    "git_blob": "c251a4133c81852a150c6668a570e142dc776b6e",
+    "download_sha256": "74c11bff524336576096993cbfcdcdc2ef4fa2fa4409df693bdcbc6c666282ae"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -197,7 +206,8 @@
     "file": "h3-base/transformer/diffusion_pytorch_model.safetensors.index.json",
     "bytes": 64488,
     "sha256": null,
-    "git_blob": "da038def25abb5a5e4be509816ee55a0b7105e09"
+    "git_blob": "da038def25abb5a5e4be509816ee55a0b7105e09",
+    "download_sha256": "ac30a3b58963f2e735d493475fbb81853a5735ec947619648b3e045acda6783e"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -205,7 +215,8 @@
     "file": "h3-base/vae/config.json",
     "bytes": 2011,
     "sha256": null,
-    "git_blob": "ed4874a5886972f4029fcd99cbbe72de0177b2c9"
+    "git_blob": "ed4874a5886972f4029fcd99cbbe72de0177b2c9",
+    "download_sha256": "78f67deec3d63aae807f2bfe7154bc1e26f6372cb20b63265fcbae1b62bb5745"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -237,7 +248,8 @@
     "file": "h3-base/vae/diffusion_pytorch_model.safetensors.index.json",
     "bytes": 74228,
     "sha256": null,
-    "git_blob": "05dfb255c44daa4f1ac487f57f18210fa5c19439"
+    "git_blob": "05dfb255c44daa4f1ac487f57f18210fa5c19439",
+    "download_sha256": "15f6d44553c3c616b0dc999920aa784f92ecee7e4201f1f99ac405cfbf3061ca"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -245,7 +257,8 @@
     "file": "stage-dmd-step-250/adapters/default/adapter_config.json",
     "bytes": 415,
     "sha256": null,
-    "git_blob": "ef3c876ab5a596a1b6b4b28f3443bbe30c5455d8"
+    "git_blob": "ef3c876ab5a596a1b6b4b28f3443bbe30c5455d8",
+    "download_sha256": "89e0ff8920b9629b826eb99ab6150cce6924a53aa445186d1b493225fd091b96"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -261,7 +274,8 @@
     "file": "stage-dmd-step-250/adapters/turbo/adapter_config.json",
     "bytes": 22264,
     "sha256": null,
-    "git_blob": "dbd7be544c9f3092b229f5cb6487f8da2f4ccc05"
+    "git_blob": "dbd7be544c9f3092b229f5cb6487f8da2f4ccc05",
+    "download_sha256": "627968f670747c29cd7a0d3f8c75166e501d70f9e829b5cd3242a8f14cefbc18"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -277,7 +291,8 @@
     "file": "stage-dmd-step-250/linear_branch/config.json",
     "bytes": 465,
     "sha256": null,
-    "git_blob": "314502a7c9d403f28493ac1cb5054032c8c7b545"
+    "git_blob": "314502a7c9d403f28493ac1cb5054032c8c7b545",
+    "download_sha256": "decb06ac7e664610f677fb445318502b3c51f9c1b8603a2cdd00b16042be5bc8"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -293,7 +308,8 @@
     "file": "stage-dmd-step-250/metadata.json",
     "bytes": 463,
     "sha256": null,
-    "git_blob": "27ec152079222e3f2a83b8ee0bc634a77da0df01"
+    "git_blob": "27ec152079222e3f2a83b8ee0bc634a77da0df01",
+    "download_sha256": "54054ceb1c91b3fdf7fa0278e4a8841c127e8cf666b5e240d69613661f9d3e9e"
   },
   {
     "repo": "OpenVDN/vdn-minimax-h3",
@@ -301,7 +317,8 @@
     "file": "stage-dmd-step-250/model_spec.json",
     "bytes": 25705,
     "sha256": null,
-    "git_blob": "e039c13987797f91e11a3477c38fa8fd1f6a506f"
+    "git_blob": "e039c13987797f91e11a3477c38fa8fd1f6a506f",
+    "download_sha256": "4171f4384e952f1f73467981a893440c03298af4956b947e2c8a857ba9f5a62b"
   },
   {
     "repo": "t8star/Vdn-Minimax-H3-Comfy",

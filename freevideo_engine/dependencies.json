@@ -38,7 +38,7 @@
     "encoder_sha256": "35a88d51044231fe332301d7a62aa81e3f2cba62febeb446e2c1e3e0ef76f2c6",
     "edge_modelscope": {
       "repo": "OpenVDN/vdn-minimax-h3-edge",
-      "revision": "7832055a557c968ba86fa000374337560193adcf",
+      "revision": "c247caf6f9f54fab9240e78fc7e0ec233016e47a",
       "hf_revision": "5e6ecc39f472f98ca7493000df49a4f712efb61a",
       "hf_snapshot_revision": "d95329e1441404e95082053b148ba5f8d3dd754f",
       "probe_file": "cache/blocks/00.safetensors"
@@ -46,30 +46,35 @@
     "edge_modelscope_variants": {
       "rowwise": {
         "repo": "OpenVDN/vdn-minimax-h3-edge",
-        "revision": "5be1ff90c02c9b1c1ce7300d6a803931732e6ab0",
+        "revision": "c247caf6f9f54fab9240e78fc7e0ec233016e47a",
         "hf_revision": "ae041e5aec51f8516a3416bd86d579cb29c4c796",
         "probe_file": "rowwise/cache/blocks/00.safetensors"
       },
       "int8_convrot": {
         "repo": "OpenVDN/vdn-minimax-h3-edge",
-        "revision": "17738b37839b490c5ae95246d8cb41893e76d887",
+        "revision": "c247caf6f9f54fab9240e78fc7e0ec233016e47a",
         "hf_revision": "da37681f5a1f7015fdb63482142b865111b687d3",
         "probe_file": "int8-convrot/cache/blocks/00.safetensors"
       },
       "community_sigma3": {
         "repo": "OpenVDN/vdn-minimax-h3-edge",
         "hf_revision": "4bbe518a5b24aa596f1e262e5f1a08062790670b",
-        "revision": "bbb2b06aded5536f42294fe4f3449240f86a5fdd"
+        "revision": "c247caf6f9f54fab9240e78fc7e0ec233016e47a"
       },
       "sampling_levels": {
         "repo": "OpenVDN/vdn-minimax-h3-edge",
         "hf_revision": "0cd66b30a58021012def78b0340caf131e0df5c2",
-        "revision": "1bff010a4fd429be95455fb0dbb2a34037f1bccd"
+        "revision": "c247caf6f9f54fab9240e78fc7e0ec233016e47a"
       },
       "reference_audio": {
         "repo": "OpenVDN/vdn-minimax-h3-edge",
         "hf_revision": "b3a8dd8d4cf215b3a90bcc20b4362318f5f4f158",
-        "revision": "fe57b4d98c95f9c6798431ff4d37515fa1192d97"
+        "revision": "c247caf6f9f54fab9240e78fc7e0ec233016e47a"
+      },
+      "sampling_steps": {
+        "repo": "OpenVDN/vdn-minimax-h3-edge",
+        "hf_revision": "8f6860a5e5de2844bb9af7fa801e0fafb2376bd5",
+        "revision": "c247caf6f9f54fab9240e78fc7e0ec233016e47a"
       }
     },
     "latent_upscaler": {

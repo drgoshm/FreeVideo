@@ -37,12 +37,25 @@ def install_streamed_forward(model, chunk=1024, residual_offload=False):
     def blocks(self, value, length, temb, adaln_indices, rotary):
         first = length not in collected
         collected.add(length)
+        cache = getattr(self, '_freevideo_step_cache', None)
+        cache = cache if cache is not None and not cache.disabled_reason and cache.block_level else None
+        if cache is not None and not isinstance(value, torch.Tensor):
+            cache.disabled_reason = 'residual_offload'
+            cache = None
         for index, block in enumerate(self.transformer_blocks):
             if first and index in (1, 2) and hasattr(value, 'collect_after_store'):
                 value.collect_after_store = True
+            if cache is not None and index == 0:
+                cache.before_first_block(value)
             value = block(value, temb, adaln_indices, rotary)
             if first and index == 0 and not hasattr(value, 'collect_after_store'):
                 gc.collect()
+            if cache is not None and index == 0 and cache.after_first_block(value):
+                if cache.offloader is not None:
+                    cache.offloader.end_pass_early()
+                return value
+        if cache is not None:
+            cache.after_last_block(value)
         return value
 
     def forward(self, hidden_states, audio_hidden_states, encoder_hidden_states,
@@ -55,6 +68,24 @@ def install_streamed_forward(model, chunk=1024, residual_offload=False):
         length = position_ids.shape[0]
         if position_ids.shape != (length, 3) or token_tags.shape != (length,) or timestep_indices.shape != (length,):
             raise ValueError('Invalid packed sequence geometry')
+        cache = getattr(self, '_freevideo_step_cache', None)
+        if cache is not None and residual_offload and cache.block_level:
+            # The first-block cache keeps packed residuals on the GPU; reusing
+            # a whole step (EasyCache) does not touch them.
+            cache.disabled_reason = 'residual_offload'
+        cache = cache if cache is not None and not cache.disabled_reason else None
+        sigmas = None
+        if cache is not None:
+            cache.begin(video_indices, audio_indices)
+            if not cache.block_level:
+                # H3 time is t = 1 - sigma; generated video rows come last.
+                sigmas = (1. - float(timestep[timestep_indices[video_indices[-1]]]),
+                          1. - float(timestep[timestep_indices[audio_indices[0]]]))
+                cached = cache.skip_forward(hidden_states[0], audio_hidden_states[0], sigmas)
+                if cached is not None:
+                    video = cached[0][None].to(self.proj_out.weight.dtype)
+                    audio = cached[1][None].to(self.audio_proj_out.weight.dtype)
+                    return MiniMaxH3TransformerOutput(sample=video, audio_sample=audio) if return_dict else (video, audio)
         rotary = self.rope(position_ids)
         text = getattr(self, '_freevideo_refined_text', None)
         if text is None:
@@ -95,6 +126,8 @@ def install_streamed_forward(model, chunk=1024, residual_offload=False):
             audio_all[:, start:start + chunk] = self.audio_proj_out(normalized)
         video = video_all.index_select(1, video_indices)
         audio = audio_all.index_select(1, audio_indices)
+        if sigmas is not None:
+            cache.record_forward(hidden_states[0], audio_hidden_states[0], sigmas, video[0], audio[0])
         return MiniMaxH3TransformerOutput(sample=video, audio_sample=audio) if return_dict else (video, audio)
 
     model.forward = types.MethodType(forward, model)

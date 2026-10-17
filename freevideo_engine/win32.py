@@ -40,6 +40,7 @@ def kernel32():
         'CreateFileW': (HANDLE, [C.c_wchar_p, DWORD, DWORD, C.c_void_p, DWORD, DWORD, HANDLE]),
         'GetFileInformationByHandle': (BOOL, [HANDLE, C.c_void_p]),
         'GetFileInformationByHandleEx': (BOOL, [HANDLE, C.c_int, C.c_void_p, DWORD]),
+        'SetStdHandle': (BOOL, [DWORD, HANDLE]),
     }
     for name, (result, arguments) in declarations.items():
         function = getattr(lib, name)
@@ -51,6 +52,32 @@ def checked(value):
     if not value:
         raise C.WinError(C.get_last_error())
     return value
+
+
+def private_stdin(encoding='utf-8'):
+    """Read the parent's pipe through a private handle; standard input becomes NUL.
+
+    A thread blocked reading the standard-input pipe stalls DLL loads on the
+    main thread: importing numpy (its OpenBLAS) queries the standard handles
+    and waits until the parent writes again. A private duplicate keeps those
+    queries away from the pending read.
+    """
+    import msvcrt
+    import sys
+    private = os.dup(sys.stdin.fileno())
+    try:
+        null = os.open(os.devnull, os.O_RDONLY)
+        try:
+            os.dup2(null, 0)
+        finally:
+            os.close(null)
+        checked(kernel32().SetStdHandle(DWORD(-10 & 0xffffffff), msvcrt.get_osfhandle(0)))  # STD_INPUT_HANDLE
+    except OSError:
+        # Put the pipe back so the caller can still read from sys.stdin.
+        os.dup2(private, 0)
+        os.close(private)
+        raise
+    return open(private, encoding=encoding, errors=sys.stdin.errors)
 
 
 def process_exited(pid):

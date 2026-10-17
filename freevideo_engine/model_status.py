@@ -2,13 +2,16 @@
 import math
 import threading
 
-FAMILIES = ('video', 'text', 'decoder', 'sampling')
-NAMES = {'video': ('Video model', '视频模型'), 'text': ('Text encoder', '文本编码器'),
+FAMILIES = ('video', 'text', 'decoder', 'sampling', 'image')
+NAMES = {'video': ('Video model', '视频模型'), 'text': ('Prompt model', '提示词模型'),
          'decoder': ('Video & audio decoder', '视频与音频解码器'),
-         'sampling': ('Sampling caches', '采样缓存')}
+         'sampling': ('Sampling caches', '采样缓存'),
+         'image': ('Image generation models', '图像生成模型')}
 
 
 def family(row):
+    if row.get('family') == 'image' or row.get('model_id') == 'qwen-image-2.1-turbo':
+        return 'image'
     if row.get('sampling_file'):
         return 'sampling'
     if not row['repo'].startswith('OpenVDN/'):

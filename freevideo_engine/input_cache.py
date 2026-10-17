@@ -13,6 +13,7 @@ import uuid
 
 from .monitoring import save
 from .paths import data_root
+from . import disk_space
 
 
 def digest(path):
@@ -96,15 +97,19 @@ class InputCache:
             self.note = 'Input exceeds the small-input cache limit; original artifact retained'
             return False
         self.root.mkdir(parents=True, exist_ok=True)
-        if shutil.disk_usage(self.root).free < size + 2**30:
+        if disk_space.free_bytes(self.root) < size + 2**30:
             self.note = 'Low disk space; existing caches retained, new input not cached'
             return False
         checksum = digest(source)
         target = self.root / (checksum + '.pt')
         if target.exists() and digest(target) != checksum:
-            target = self.root / (checksum + '-' + uuid.uuid4().hex + '.pt')
+            target = self.root / (checksum[:31] + '-' + uuid.uuid4().hex + '.pt')
         if not target.exists():
-            temporary = source if move else target.with_suffix('.partial-' + uuid.uuid4().hex)
+            # Nothing written here has a longer name than the receipt. Windows
+            # refuses a path past 260 characters: a longer staging name left an
+            # installation in a deep folder unable to save an input whose
+            # receipt and file both fit, so every repeat encoded it again.
+            temporary = source if move else self.root / (uuid.uuid4().hex + '.partial')
             if not move:
                 with temporary.open('xb') as output, source.open('rb') as stream:
                     shutil.copyfileobj(stream, output, length=1024 * 1024)
@@ -116,8 +121,10 @@ class InputCache:
         if receipt.exists():
             # Keep old receipts too, including malformed ones, for diagnostics.
             prior = receipt.read_bytes()
-            if not (self.root / (receipt.stem + '-' + hashlib.sha256(prior).hexdigest()[:16] + '.previous.json')).exists():
-                (self.root / (receipt.stem + '-' + hashlib.sha256(prior).hexdigest()[:16] + '.previous.json')).write_bytes(prior)
+            previous = self.root / (receipt.stem[:38] + '-' + hashlib.sha256(prior).hexdigest()[:16] + '.previous.json')
+            if not previous.exists():
+                previous.write_bytes(prior)
         save(receipt, {'identity': self.identity, 'file': target.name, 'bytes': size,
-                       'sha256': checksum, 'metrics': metrics, 'created_epoch': time.time()})
+                       'sha256': checksum, 'metrics': metrics, 'created_epoch': time.time()},
+             staging='receipt.')
         return True

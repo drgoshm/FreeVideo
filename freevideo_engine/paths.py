@@ -33,8 +33,8 @@ def installed_model_root():
     return model_root()
 
 
-def add_vdn():
-    root = vdn_root().resolve()
+def add_vdn(root=None):
+    root = (root or vdn_root()).resolve()
     if not (root / 'src/models/hybrid_attention.py').is_file():
         raise RuntimeError('VDN dependency is missing. Run freevideo setup or set FREEVIDEO_VDN_ROOT.')
     if str(root) not in sys.path:

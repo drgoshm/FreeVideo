@@ -17,7 +17,7 @@ def geometry(width=1344, height=768, frames=None, seconds=None):
     aligned = requested + (5 - requested) % 17
     latent_frames = (aligned - 5) // 17 * 5 + 2
     if latent_frames < 12:
-        raise ValueError('H3 hybrid window inference needs at least 39 aligned frames (1.625 seconds).')
+        raise ValueError('The video must be at least 1.625 s long.')
     return dict(width=width, height=height, fps=24, requested_frames=requested,
                 requested_seconds=seconds, frames=aligned, seconds=aligned / 24,
                 latent_frames=latent_frames, video_tokens=latent_frames * (height // 32) * (width // 32),
@@ -29,10 +29,14 @@ def sampler_for_canvas(sampler, width, height):
 
     Engine.sample supplies no_grad. Never edit the upstream file or mutate its
     module globals: two Engine instances can use different canvases safely.
+    The upstream sampler builds its schedulers by name; it gets the engine's,
+    whose step grid is the one the modulation tables were made with.
     """
+    from .step_grid import scheduler
     original = inspect.unwrap(sampler)
     bound = types.FunctionType(original.__code__,
-        dict(original.__globals__, LATENT_H=height // 16, LATENT_W=width // 16),
+        dict(original.__globals__, LATENT_H=height // 16, LATENT_W=width // 16,
+             MiniMaxH3Scheduler=scheduler),
         original.__name__, original.__defaults__, original.__closure__)
     bound.__kwdefaults__ = original.__kwdefaults__
     return bound

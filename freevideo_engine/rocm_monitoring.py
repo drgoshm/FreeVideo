@@ -3,11 +3,11 @@ import os
 from pathlib import Path
 import threading
 
-from .monitoring import Activity, Monitor
+from .monitoring import Activity, Monitor, UnavailablePrograms
 
 
 class ROCmMonitor(Monitor):
-    def __init__(self, path, interval=0.05, device=None):
+    def __init__(self, path, interval=0.05, device=None, pid=None):
         self.device = str(device or os.environ.get('ROCR_VISIBLE_DEVICES', ''))
         if not self.device.startswith('GPU-') or ',' in self.device:
             raise ValueError('AMDGPU monitoring requires one explicit ROCR GPU UUID')
@@ -31,6 +31,7 @@ class ROCmMonitor(Monitor):
         self.errors = []
         self.max_temperature = self.max_power_mw = None
         self.activity, self.busy_activity = Activity(), Activity()
+        self.programs = UnavailablePrograms()
         self.hwmon = next((self.root / 'hwmon').glob('hwmon*'), None)
 
     def sample(self):

@@ -31,7 +31,7 @@ def install(memory):
         if (not getattr(_local, 'keep', False) and not OWNER.active and
                 OWNER.process is not None and OWNER.process.poll() is None):
             if device is None or memory_required > memory.get_free_memory(device):
-                OWNER.close()
+                OWNER.release('comfy_model')
         return original(memory_required, device, *args, **kwargs)
 
     free_memory._freevideo_resident_cooperation = True

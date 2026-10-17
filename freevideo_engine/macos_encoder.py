@@ -14,7 +14,7 @@ import time
 import types
 
 
-def nvfp4_weight(weight, dtype, device, *, rows=128):
+def nvfp4_weight(weight, dtype, device, *, rows=128, row_range=None):
     """Decode original E2M1 storage in bounded rows using FP32 scale arithmetic."""
     import torch
     from comfy_kitchen.float_utils import from_blocked
@@ -26,7 +26,12 @@ def nvfp4_weight(weight, dtype, device, *, rows=128):
     count, columns = packed.shape[0], packed.shape[1] * 2
     if columns % 16 or params.scale.numel() != 1:
         raise ValueError('Invalid NVFP4 scale geometry')
-    scales = from_blocked(params.block_scale, num_rows=count, num_cols=columns // 16).float()
+    if row_range is None:
+        scales = from_blocked(params.block_scale, num_rows=count, num_cols=columns // 16).float()
+    else:
+        from .backends.mps_nvfp4 import row_storage
+        packed, scales = row_storage(weight, row_range)
+        count = row_range[1] - row_range[0]
     lut = torch.tensor([0., .5, 1., 1.5, 2., 3., 4., 6., -0., -.5, -1., -1.5, -2., -3., -4., -6.])
     result = torch.empty((count, columns), dtype=dtype, device=device)
     for start in range(0, count, rows):
@@ -37,7 +42,7 @@ def nvfp4_weight(weight, dtype, device, *, rows=128):
         decoded.mul_(scales[start:start + rows, :, None]).mul_(params.scale.float())
         result[start:start + rows].copy_(decoded.reshape(len(part), columns).to(dtype))
         del part, indices, decoded
-    return result[:params.orig_shape[0], :params.orig_shape[1]]
+    return result[:count if row_range is not None else params.orig_shape[0], :params.orig_shape[1]]
 
 
 def install_weight_reader(clip, backend, checkpoint, *, decoder=nvfp4_weight):
@@ -110,6 +115,12 @@ def install_weight_reader(clip, backend, checkpoint, *, decoder=nvfp4_weight):
         def progress(module, inputs, output, index=index):
             print(json.dumps(dict(event='encoder_layer', completed=index + 1, total=50)), flush=True)
         handles.append(layer.register_forward_hook(progress))
+    from .macos_encoder_linear import install
+    stats['projection_slices'], slice_handles = install(
+        [module for module, function in selected if function is linear], model.layers,
+        decoder=decoder, quantized_type=QuantizedTensor, backend=backend,
+        guard=guard, release=lambda: release_mapped_pages([checkpoint]), reader_stats=stats)
+    handles.extend(slice_handles)
     return stats, restores, handles
 
 
@@ -188,6 +199,9 @@ def encode(prompt, output, *, root, budget_bytes=3 * 2**30, reserve_bytes=2 * 2*
                 model_options=dict(initial_device=torch.device('cpu'), load_device=torch.device('mps'),
                     offload_device=torch.device('cpu'), dtype=torch.bfloat16), disable_dynamic=True)
             stats, restores, handles = install_weight_reader(clip, backend, checkpoint, decoder=decoder)
+            from .macos_encoder_attention import install
+            stats['attention'], attention_handles = install(clip)
+            handles.extend(attention_handles)
             # Placement is handled by the instance reader; native tokenization,
             # forward and output packing still execute through the CLIP API.
             clip.load_model = lambda tokens: clip.patcher
@@ -204,7 +218,6 @@ def encode(prompt, output, *, root, budget_bytes=3 * 2**30, reserve_bytes=2 * 2*
                 # encoder reference before the independent input VAE is loaded.
                 del encoded, tokens, vision_kwargs
                 release_encoder()
-                # Text streaming deliberately uses a small allocation ceiling.
                 # Input VAEs have separate workspaces: re-admit after releasing
                 # text weights, against the request's original capacity bound.
                 # configure_budget also enforces live availability, the reserve

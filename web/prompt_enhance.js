@@ -28,9 +28,44 @@ export class PromptVersions {
     select(name) { if (name === 'original' || this.value.rewritten) { this.value.selected = name; this.value.useOriginal = name === 'original'; } }
 }
 
+// Best-effort imports have no UI state and never hold up enhancement or video.
+export function promptPrestart(api, nodeId, enabled, alive = () => true) {
+    let pending = null, completed = false;
+    // Enhancement can be turned off, or the panel closed, while the token is fetched.
+    const ready = () => alive() && enabled();
+    function request() {
+        if (!ready()) return Promise.resolve();
+        if (pending) return pending;
+        pending = (async () => {
+            const reply = await api.fetchApi('/freevideo/prompt-vlm');
+            if (!reply.ok || !ready()) return;
+            const info = await reply.json();
+            if (!ready()) return;
+            await api.fetchApi('/freevideo/prompt-vlm/prestart', {method: 'POST',
+                headers: {'Content-Type': 'application/json', 'X-FreeVideo-Prompt': info.token}, body: '{}'});
+        })().catch(() => {}).finally(() => { pending = null; });
+        return pending;
+    }
+    const onExecuted = event => { if (String(event.detail?.node) === String(nodeId)) completed = true; };
+    const onStatus = event => {
+        const remaining = (event.detail?.status || event.detail)?.exec_info?.queue_remaining;
+        if (completed && remaining === 0) {
+            completed = false;
+            if (enabled()) void request();
+        }
+    };
+    api.addEventListener('executed', onExecuted);
+    api.addEventListener('status', onStatus);
+    return {request, dispose() {
+        api.removeEventListener('executed', onExecuted);
+        api.removeEventListener('status', onStatus);
+    }};
+}
+
 // An empty box is never rewritten, the untouched starter prompt included:
 // enhancement waits for the user's own scene.
-export function createPromptEnhancer({node, input, editor, api, context, setText, t, starter = '', onReport = () => {}, onChange = () => {}}) {
+// `prepare` turns the user's text into what the model reads (character mentions written out with their pictures).
+export function createPromptEnhancer({node, input, editor, api, context, setText, t, starter = '', prepare = text => text, onReport = () => {}, onChange = () => {}}) {
     const saved = node.properties?.freevideo_prompt_versions;
     // Drafts saved before the starter became a placeholder hold it as the original.
     const versions = new PromptVersions(starter && saved?.original === starter ? {...saved, original: ''} : saved, input.value);
@@ -41,6 +76,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
     toggle.setAttribute('aria-label', t('Prompt enhancement', '提示词增强'));
     label.append(toggle, el('span', t('FreeToken enhancement', 'FreeToken 提示词增强')));
     label.title = t('Based on FreeToken. Rewrite locally with reference images, following MiniMax H3 guidelines.', '基于 FreeToken，结合参考图，在本机按 MiniMax H3 规则改写。');
+    const enhancementHint = label.title;
     const tabs = el('div', null, 'fv-enhance-tabs'); tabs.setAttribute('role', 'group'); tabs.setAttribute('aria-label', t('Prompt version', '提示词版本'));
     const buttons = {};
     for (const [name, text] of [['original', t('Original', '原文')], ['rewritten', t('Enhanced', '改写')]]) {
@@ -74,6 +110,13 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
     install.append(detail, actions);
     bar.append(label, tabs, redo, cancel); element.append(bar, editor || input, status, install);
     let disposed = false, token = '', job = '', running = null, consent = null, cancelling = false, waiting = false, replacing = false;
+    const prestart = promptPrestart(api, node.id, () => versions.value.enabled, () => !disposed && !input.disabled);
+    const onFocus = () => { if (versions.value.enabled) void prestart.request(); };
+    input.addEventListener('focus', onFocus);
+    if (versions.value.enabled) void prestart.request();
+    // Available RAM the model needs; the server knows the usual case for this card.
+    let ramBytes = 11 * 2 ** 30;
+    const gib = value => String(Math.round(value / 2 ** 30));
     const errorText = error => ({
         busy: t('Finish the current queue before enhancing this prompt.', '请等待当前队列完成后再改写。'),
         prompt_required: t('Type a prompt first; enhancement rewrites it before generating.', '请先输入提示词，生成前会自动改写。'),
@@ -81,7 +124,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         model_missing: t('Download the optional model to enable enhancement.', '下载可选模型后即可启用。'),
         download_failed: t('Download paused. Retry to resume.', '下载已暂停，重试即可继续。'),
         disk_space: t('Not enough disk space for the optional model.', '可选模型的磁盘空间不足，请清理后重试。'),
-        ram_space: t('This model needs about 11 GiB of available RAM to load. You can keep using the original.', '此模型加载需约 11 GiB 可用内存，可先使用原文生成。'),
+        ram_space: t(`This model needs about ${gib(error?.ramBytes || ramBytes)} GiB of available RAM to load. You can keep using the original.`, `此模型加载需约 ${gib(error?.ramBytes || ramBytes)} GiB 可用内存，可先使用原文生成。`),
         unsupported_media: t('Use images added in Media for enhancement; connected nodes, video and audio are not supported yet.', '增强暂支持在素材中添加的图片；连接节点、视频和音频暂不支持。'),
         too_many_images: t('Use up to 8 reference images for enhancement.', '增强暂支持最多 8 张参考图。'),
         invalid_prompt: t('Enter a prompt of up to 12,000 characters.', '请输入不超过 12,000 字符的提示词。'),
@@ -101,15 +144,18 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
     }
     function render() {
         toggle.checked = Boolean(versions.value.enabled);
+        label.title = input.disabled ? '' : enhancementHint;
         tabs.hidden = !versions.value.rewritten;
         for (const [name, b] of Object.entries(buttons)) {
             b.setAttribute('aria-pressed', String(versions.value.selected === name));
             b.disabled = input.disabled || (name === 'rewritten' && !versions.value.enabled);
         }
         redo.hidden = !versions.value.enabled || Boolean(running); redo.disabled = input.disabled;
-        redo.title = versions.value.rewritten ? t('Rewrite again', '重新改写') : t('Rewrite', '改写');
-        redo.setAttribute('aria-label', redo.title);
+        const rewriteLabel = versions.value.rewritten ? t('Rewrite again', '重新改写') : t('Rewrite', '改写');
+        redo.title = input.disabled ? '' : rewriteLabel;
+        redo.setAttribute('aria-label', rewriteLabel);
         cancel.hidden = !running || install.hidden === false; cancel.disabled = cancelling;
+        cancel.title = cancelling ? t('Cancelling…', '正在取消…') : '';
         element.dataset.busy = String(Boolean(running));
         element.dataset.enabled = String(Boolean(versions.value.enabled));
     }
@@ -130,29 +176,40 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
     }
     async function cancelJob() {
         cancelling = true; consent?.(false); consent = null; render();
-        if (job) await post('cancel', {job});
+        const request = running;
+        try { if (job) await post('cancel', {job}); }
+        catch (error) { if (running === request) { cancelling = false; render(); } throw error; }
     }
     cancel.onclick = () => cancelJob().catch(error => { show(errorText(error), 'error'); });
     async function poll(action, body) {
         if (disposed || cancelling) throw new Error('cancelled');
         const started = await post(action, body); job = started.job;
+        const since = performance.now(), elapsed = () => Math.floor((performance.now() - since) / 1000);
         if (disposed || cancelling) await post('cancel', {job});
         try {
             for (;;) {
+                if (disposed || cancelling) throw new Error('cancelled');
                 const row = await post('status', {job});
+                if (disposed || cancelling) throw new Error('cancelled');
                 if (row.rewrite_report_id) {
                     node.properties.freevideo_prompt_report = row.rewrite_report_id;
                     node.graph?.change();
                     onReport(row);
                 }
                 if (row.phase === 'complete') return row;
-                if (row.phase === 'failed') throw new Error(row.error || 'rewrite_failed');
+                if (row.phase === 'failed') throw Object.assign(new Error(row.error || 'rewrite_failed'), {ramBytes: row.diagnostics?.ram_required_bytes});
                 if (row.phase === 'cancelled') throw new Error('cancelled');
                 if (disposed) throw new Error('cancelled');
                 if (row.phase === 'download') {
                     const fraction = (row.done || 0) / (row.total || 1), gib = value => (value / 2 ** 30).toFixed(1);
                     show(t(`Downloading the model · ${gib(row.done || 0)} / ${gib(row.total || 0)} GiB`, `正在下载模型 · ${gib(row.done || 0)} / ${gib(row.total || 0)} GiB`), 'progress', fraction);
-                } else show(row.phase === 'rewriting' ? t('Enhancing the prompt…', '正在改写提示词…') : t('Preparing enhancement…', '正在准备提示词增强…'), 'progress');
+                } else {
+                    // The ellipsis says "still going" until the seconds start counting.
+                    const [en, zh] = row.phase === 'rewriting' ? ['Enhancing the prompt', '正在改写提示词'] : ['Preparing enhancement', '正在准备提示词增强'];
+                    const s = elapsed(), m = Math.floor(s / 60), r = s % 60;
+                    show(s < 1 ? t(en + '…', zh + '…') : s < 60 ? t(`${en} · ${s} s`, `${zh} · ${s} 秒`)
+                        : t(`${en} · ${m} min${r ? ` ${r} s` : ''}`, `${zh} · ${m} 分${r ? ` ${r} 秒` : ''}`), 'progress');
+                }
                 await new Promise(resolve => setTimeout(resolve, 400));
             }
         } catch (error) {
@@ -167,18 +224,21 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
             waiting = true; show(errorText({message: 'prompt_required'}), 'note'); input.focus();
             throw new Error('prompt_required');
         }
+        cancelling = false;
         const execute = async () => {
-            cancelling = false;
+            if (disposed || cancelling) throw new Error('cancelled');
             versions.value.useOriginal = false;
             const scene = context(), key = versions.key(scene), original = versions.value.original, edits = versions.value.edits;
             const reply = await api.fetchApi('/freevideo/prompt-vlm');
             const info = await reply.json();
+            if (disposed || cancelling) throw new Error('cancelled');
             if (!reply.ok) throw new Error(info.error);
             token = info.token;
+            if (info.ram_bytes) ramBytes = info.ram_bytes;
             if (!info.ready) {
                 const model = String(info.model || 'Qwen/Qwen3-VL-4B-Instruct').split('/').pop().replace(/-Instruct$/, '');
-                detail.textContent = t(`Local model ${model} · ${(info.bytes / 2 ** 30).toFixed(1)} GiB download · needs 11 GiB free RAM. Your prompt and images stay on this computer.`,
-                    `本地模型 ${model} · 下载 ${(info.bytes / 2 ** 30).toFixed(1)} GiB · 需 11 GiB 可用内存。提示词和图片只在本机处理。`);
+                detail.textContent = t(`Local model ${model} · ${(info.bytes / 2 ** 30).toFixed(1)} GiB download · needs ${gib(ramBytes)} GiB free RAM. Your prompt and images stay on this computer.`,
+                    `本地模型 ${model} · 下载 ${(info.bytes / 2 ** 30).toFixed(1)} GiB · 需 ${gib(ramBytes)} GiB 可用内存。提示词和图片只在本机处理。`);
                 install.hidden = false; render();
                 const accepted = await new Promise(resolve => { consent = resolve; agree.onclick = () => resolve(true); decline.onclick = () => resolve(false); });
                 consent = null; install.hidden = true; render();
@@ -189,7 +249,7 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
                 }
                 await poll('install', {accept_download: true});
             }
-            const result = await poll('rewrite', {text: original, ...scene});
+            const result = await poll('rewrite', {text: prepare(original), ...scene});
             if (disposed || cancelling) throw new Error('cancelled');
             if (edits !== versions.value.edits || !versions.accept(key, context(), result.text)) throw new Error('stale');
             apply(); show('');
@@ -197,28 +257,42 @@ export function createPromptEnhancer({node, input, editor, api, context, setText
         running = Promise.resolve().then(execute).catch(error => {
             if (!disposed) show(errorText(error), error?.message === 'cancelled' ? '' : 'error');
             throw error;
-        }).finally(() => { running = null; install.hidden = true; render(); });
+        }).finally(() => { running = null; cancelling = false; install.hidden = true; render(); });
         render();
         return running;
     }
     toggle.onchange = () => {
         versions.value.enabled = toggle.checked;
         if (!toggle.checked) { cancelJob().catch(() => {}); versions.select('original'); apply(); }
-        else { versions.value.useOriginal = false; save(); render(); enhance().catch(() => {}); }
+        else { void prestart.request(); versions.value.useOriginal = false; save(); render(); enhance().catch(() => {}); }
     };
     redo.onclick = () => enhance().catch(() => {});
     show(''); save(false); render();
+    function useOriginal(error) {
+        console.warn('FreeVideo prompt rewrite failed; using the original prompt.', error?.message);
+        versions.value.selected = 'original'; apply();
+        show(t('Could not enhance; generated with the original.', '没能改写，已用原文生成。'), 'note');
+    }
     return {element, async beforeGenerate() {
         if (running) {
             try { await running; }
-            catch (error) { if (versions.value.enabled && !versions.value.useOriginal) return false; }
+            catch (error) {
+                if (versions.value.enabled && !versions.value.useOriginal) {
+                    if (error?.message === 'cancelled' || cancelling || disposed) return false;
+                    useOriginal(error); return;
+                }
+            }
         }
         // An untouched box generates the starter prompt as it is.
         if (!versions.value.enabled || versions.value.useOriginal || !versions.value.original.trim()) return;
         try { if (!versions.fresh(context())) await enhance(); }
-        catch (error) { show(errorText(error), error?.message === 'cancelled' ? '' : 'error'); return false; }
+        catch (error) {
+            if (error?.message === 'cancelled' || cancelling || disposed) { show(errorText({message: 'cancelled'})); return false; }
+            useOriginal(error);
+        }
     }, sync() { if (input.value !== versions.text()) changed(); }, dispose() {
-        disposed = true; cancelJob().catch(() => {}); input.removeEventListener('input', changed);
+        disposed = true; prestart.dispose(); cancelJob().catch(() => {}); input.removeEventListener('input', changed);
         input.removeEventListener('beforeinput', replace);
+        input.removeEventListener('focus', onFocus);
     }};
 }

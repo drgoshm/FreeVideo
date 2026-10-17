@@ -49,6 +49,14 @@ class PreloadCancelled(Exception):
     """A completed video stays successful when speculative work is cancelled."""
 
 
+# How long cancelled placement may take to hand the worker back. Past this the
+# worker is stopped, and with it every model it holds: the next request then
+# pays a new process and loads everything again, which costs far more than
+# these seconds. One native transfer in flight cannot be interrupted, and on a
+# slow disk a single large weight takes longer than a second.
+YIELD_SECONDS = 6.
+
+
 @contextmanager
 def interruptible_load(patcher, check):
     """Yield between native module transfers, with the original loader intact.
@@ -78,6 +86,28 @@ def interruptible_load(patcher, check):
             return original_patch(*args, **kwargs)
         replace(patcher, 'patch_weight_to_device', patch)
         replace(patcher, 'pin_weight_to_device', lambda *args, **kwargs: check())
+        # The native loader answers a failed placement by moving every weight
+        # it already placed back to host memory. Here that is a full
+        # GPU-to-CPU copy, as much new host memory as was placed, before the
+        # worker can yield; under RAM pressure it is the wrong direction too.
+        # The caller discards a model whose placement did not finish, so its
+        # tensors stay where they are. None is unpatch_model's own "do not
+        # move" mode.
+        native_detach = getattr(patcher, 'detach', None)
+        def detach(*args, **kwargs):
+            native_unpatch = patcher.unpatch_model
+            existed, previous = 'unpatch_model' in vars(patcher), vars(patcher).get('unpatch_model')
+            patcher.unpatch_model = lambda device_to=None, unpatch_weights=True: native_unpatch(
+                device_to=None, unpatch_weights=unpatch_weights)
+            try:
+                return native_detach(*args, **kwargs)
+            finally:
+                if existed:
+                    patcher.unpatch_model = previous
+                else:
+                    del patcher.unpatch_model
+        if callable(native_detach):
+            replace(patcher, 'detach', detach)
         yield
     finally:
         for obj, name, existed, value in reversed(saved):
@@ -104,7 +134,7 @@ class IdleEncoder:
                 if self.process is not None and self.process.poll() is None:
                     processes.stop(self.process, grace=1.)
         if self.thread is not None:
-            self.thread.join(timeout=3.)
+            self.thread.join(timeout=YIELD_SECONDS+2.)
             if self.thread.is_alive():
                 # A blocked disk read/native copy is not indefinitely allowed
                 # to delay the next prompt. The controller stops the real GPU
@@ -174,7 +204,7 @@ class IdleEncoder:
             except Exception as error:
                 if self.process is not None and self.process.poll() is None:
                     processes.stop(self.process, grace=1.)
-                save(report, dict(state='failed', reason=str(error)))
+                save(report, dict(state='failed', reason=str(error), error_type=type(error).__name__))
 
         self.thread = threading.Thread(target=work, name='FreeVideo idle encoder', daemon=True)
         self.thread.start()
@@ -251,7 +281,7 @@ def run(request):
                     result.update(state='released', reason='Live RAM pressure interrupted speculative loading')
                 if cancelled.exists():
                     cancel_started = cancel_started or time.monotonic()
-                    if time.monotonic()-cancel_started > 1.:
+                    if time.monotonic()-cancel_started > YIELD_SECONDS:
                         raise PreloadCancelled('Preload did not yield promptly; stop the worker before foreground work')
                 try:
                     worker.wait(timeout=.1)
@@ -275,7 +305,7 @@ def run(request):
         if getattr(error, 'worker_stop_confirmed', None) is False:
             failure = classify_failure(error)
         result.update(state='cancelled' if failure['outcome'] == 'cancelled' else 'skipped' if isinstance(error, BlockingIOError) else 'failed',
-                      reason=str(error), failure=failure)
+                      reason=str(error), failure=failure, error_type=type(error).__name__)
         if attempt is not None:
             history.finish(attempt, failure['outcome'], details=result)
     finally:

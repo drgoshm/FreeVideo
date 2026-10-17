@@ -21,7 +21,7 @@ for (const language of ['en', 'zh']) {
             assert.equal(link.rel, 'noopener noreferrer');
         }
         const text = result.children.map(child => child.text).join('');
-        assert.ok(text.includes(language === 'zh' ? '让AI参考' : 'ask AI to rewrite'));
+        assert.ok(text.includes(language === 'zh' ? '让 AI 参考 MiniMax H3 Prompt Skill ↗ 重写提示词' : 'ask AI to rewrite'));
         assert.ok(text.includes('FreeToken'));
         assert.equal(result.children.some(child => child.tag === 'button' || child.tag === 'input'), false);
     });

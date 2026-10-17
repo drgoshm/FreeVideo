@@ -37,6 +37,8 @@ vendor/
 downloads/
 prepared/
 kernel-cache/
+# Dedicated compiler scratch files, also under engine in portable installations.
+tmp/
 wheels/
 machine.json
 prepared-cache.json
@@ -52,6 +54,10 @@ engine-gpu-*.lock
 /tuning/
 /input-cache/
 /comfyui.json
+# ComfyUI that ./setup.sh installs beside the engine, and the service that runs it.
+/ComfyUI/
+/ComfyUI.freevideo-download/
+/launcher/
 /optimization-runs/
 
 # Experiment directories may be symlinks to another disk.
@@ -66,3 +72,4 @@ engine-gpu-*.lock
 # Optional local prompt models, runtime binaries and private rewrite caches.
 /optional/
 *.gguf
+/out/

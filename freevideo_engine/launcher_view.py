@@ -294,7 +294,7 @@ def build(app):
     component_row = ttk.Frame(app.model_components, style='Card.TFrame'); component_row.pack(fill='x')
     app.component_buttons = {}
     for component, en, zh in (('video', 'Video model ↗', '视频模型 ↗'),
-                              ('encoder', 'Text encoder ↗', '文本编码器 ↗'), ('decoder', 'Decoders ↗', '解码器 ↗')):
+                              ('encoder', 'Prompt model ↗', '提示词模型 ↗'), ('decoder', 'Decoders ↗', '解码器 ↗')):
         button = app.button(component_row, en, zh, lambda name=component: app.model_download_link(name))
         button.configure(style='Card.TButton'); button.pack(side='left', padx=(0, 8))
         app.component_buttons[component] = button
@@ -320,7 +320,9 @@ def build(app):
     grid = ttk.Frame(app.pages[2]); grid.pack(fill='x', pady=(0, b.space(3)))
     grid.columnconfigure((0, 1, 2), weight=1, uniform='models')
     app.model_cards = {}
-    for index, name in enumerate(FAMILIES):
+    # Optional pack controls live in the Qt launcher; keep this legacy setup
+    # grid limited to the families setup itself provisions.
+    for index, name in enumerate(name for name in FAMILIES if name != 'image'):
         card = ModelCard(grid, app, name)
         card.grid(row=0, column=index, sticky='nsew',
                   padx=(0 if index == 0 else b.space(2), 0 if index == 2 else b.space(2)))

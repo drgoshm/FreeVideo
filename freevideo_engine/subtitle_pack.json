@@ -1,0 +1,107 @@
+{
+  "format": 1,
+  "repo": "OpenVDN/vdn-minimax-h3-edge",
+  "prefix": "subtitles-v1",
+  "revision": "94f5ccc7bb78917e1eed47de4fc04a61465b8673",
+  "python": "cp312",
+  "groups": {
+    "speech": [
+      {
+        "file": "en/model.int8.onnx",
+        "bytes": 46419854,
+        "sha256": "66cfde4ce0b6da9e1a4352e58f0c968f87da23070cf229c81ae0d520cddad2a2"
+      },
+      {
+        "file": "en/tokens.txt",
+        "bytes": 11611,
+        "sha256": "1adce7866285e6a4aac6208b120d5b8e4302b7cae5f2ae541c343097773fd988"
+      },
+      {
+        "file": "silero_vad_v5.onnx",
+        "bytes": 2313101,
+        "sha256": "6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396"
+      },
+      {
+        "file": "licenses/NeMo-stt_en_conformer_ctc_small-NOTICE.txt",
+        "bytes": 653,
+        "sha256": "d46e410b4d9a90c52b1f8731d961a537032094b4f894dfb54cb4f65225049693"
+      },
+      {
+        "file": "licenses/Silero-VAD-MIT.txt",
+        "bytes": 1075,
+        "sha256": "2e63e9a38b6e8fc0c7bc37ce174caca1862870856c6daf5697cfb785e925520b"
+      }
+    ],
+    "language": [
+      {
+        "file": "lid/tiny-encoder.int8.onnx",
+        "bytes": 12937772,
+        "sha256": "d24fb083ae3b1041fc24e97971d60e280c9342201fbb67b0ab428a8b4a51a434"
+      },
+      {
+        "file": "lid/tiny-decoder.int8.onnx",
+        "bytes": 89855401,
+        "sha256": "d2fece8dd42771f1df975c6c0445770d0c292bf7547c2cae04a6c0cc57540925"
+      },
+      {
+        "file": "licenses/Whisper-MIT.txt",
+        "bytes": 1063,
+        "sha256": "b5d65a59060e68c4ff940e1eddfa6f94b2d68fdf58ed7f4dd57721c997e35e9d"
+      },
+      {
+        "file": "sensevoice/model.int8.onnx",
+        "bytes": 239233841,
+        "sha256": "c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51"
+      },
+      {
+        "file": "sensevoice/tokens.txt",
+        "bytes": 315894,
+        "sha256": "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc"
+      },
+      {
+        "file": "licenses/FunASR-MODEL_LICENSE-v1.1.txt",
+        "bytes": 5306,
+        "sha256": "7dba975a2069691db4992b0592d70828b330d2f8a30a71450f4e152a554e84f8"
+      },
+      {
+        "file": "licenses/SenseVoice-NOTICE.txt",
+        "bytes": 739,
+        "sha256": "3b699b8c5d3c40d0d2d3995048dc938cd9ef928d50b9550ba265c221ba8be20a"
+      }
+    ],
+    "runtime": [
+      {
+        "file": "licenses/sherpa-onnx-build-NOTE.txt",
+        "bytes": 1420,
+        "sha256": "3c96795dec0d35ed0372d39c4974427b7c3d033b0e7d1d07135e9c0952f2ed69"
+      }
+    ]
+  },
+  "wheels": {
+    "linux-x86_64": {
+      "file": "runtime/linux-x86_64/sherpa_onnx-1.13.8-cp312-cp312-linux_x86_64.whl",
+      "bytes": 10419063,
+      "sha256": "1955198c6345be58515a91c918b02ceb857cd6ea9eb9d09831834cbcd011fe76"
+    },
+    "macos-arm64": {
+      "file": "runtime/macos-arm64/sherpa_onnx-1.13.8-cp312-cp312-macosx_11_0_arm64.whl",
+      "bytes": 9527932,
+      "sha256": "faab3e8500a113b95863a5bd8500bc64831f52d61db8d5643804852c9b1f2592"
+    },
+    "macos-x86_64": {
+      "file": "runtime/macos-x86_64/sherpa_onnx-1.13.8-cp312-cp312-macosx_10_15_x86_64.whl",
+      "bytes": 10815895,
+      "sha256": "04e65d27130051a88abeb521b8a94878cf2d23d11e9a630ab85792e1057e98ac"
+    },
+    "windows-x64": {
+      "file": "runtime/windows-x64/sherpa_onnx-1.13.8-cp312-cp312-win_amd64.whl",
+      "bytes": 7807118,
+      "sha256": "36b86ccb86c699c1ba3550e475a0a840e0c60cb9cd3553568b785081a04f10f3"
+    }
+  },
+  "origin": {
+    "speech": "csukuangfj/sherpa-onnx-nemo-ctc-en-conformer-small (NVIDIA NeMo stt_en_conformer_ctc_small, CC-BY-4.0); snakers4/silero-vad v5.0 (MIT)",
+    "language": "csukuangfj/sherpa-onnx-whisper-tiny (OpenAI Whisper tiny, MIT); csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17 (SenseVoiceSmall by FunASR/FunAudioLLM, FunASR Model Open Source License Agreement v1.1)",
+    "runtime": "k2-fsa/sherpa-onnx 1.13.8 built by FreeVideo without text-to-speech (source 11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf)"
+  }
+}

@@ -1,0 +1,22 @@
+sherpa-onnx speech runtime built by FreeVideo
+
+Based on sherpa-onnx 1.13.8 (https://github.com/k2-fsa/sherpa-onnx, Apache-2.0),
+source snapshot 11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf, built by FreeVideo.
+
+Changes (Apache-2.0 section 4(b)): built with text-to-speech, ALSA, PortAudio and
+the WebSocket server turned off; `sherpa_onnx/__init__.py` no longer imports the two
+classes that this configuration does not build (`GenerationConfig`,
+`OfflineTtsSupertonicModelConfig`) and records `__version__`. The compiled code is
+otherwise built from the unmodified upstream source. This is not the official
+sherpa-onnx distribution.
+
+Included components keep their own licences, shipped inside the wheel's
+`*.dist-info/licenses` folder: ONNX Runtime 1.28.2 (MIT, (c) Microsoft Corporation,
+with its third-party notices), Eigen 5.0.1 (MPL-2.0; source:
+https://gitlab.com/libeigen/eigen/-/tree/5.0.1, and the copy inside ONNX Runtime:
+https://github.com/microsoft/onnxruntime/tree/v1.28.2), kaldi-native-fbank,
+kaldi-decoder, kaldifst, OpenFst, simple-sentencepiece (Apache-2.0), KissFFT and
+pybind11 (BSD-3-Clause), nlohmann/json (MIT), hclust-cpp and Darts-clone (BSD-2-Clause),
+ThreadPool (Zlib).
+
+The Windows build also contains msvcp140.dll and msvcp140_1.dll (Microsoft Visual C++ 2022 runtime 14.44.35211, © Microsoft Corporation), unmodified and redistributed as permitted by Microsoft for its redistributable files.

@@ -2,6 +2,7 @@
 import json
 from pathlib import Path
 import shutil
+from .. import disk_space
 
 
 def catalog():
@@ -48,7 +49,7 @@ def install(root, progress, check):
             size = partial.stat().st_size
             if size < row['bytes']:
                 retained += size
-    if shutil.disk_usage(folder).free < total - retained + 256 * 2**20:
+    if disk_space.free_bytes(folder) < total - retained + 256 * 2**20:
         raise ValueError('disk_space')
     plan = _download_plan(root)
     # This catalog has no verified ModelScope mirror yet. Preserve configured
@@ -66,7 +67,8 @@ def install(root, progress, check):
         def moved(current, size, speed, **kwargs):
             progress(dict(phase='download', done=done + current, total=total))
         network.download(network.model_urls(plan, remote), path, row['sha256'], moved,
-                         network=plan, size=row['bytes'], keep_partial=True, stall_seconds=30)
+                         network=plan, size=row['bytes'], keep_partial=True, stall_seconds=30,
+                             slow_seconds=15, low_speed_limit=64 * 1024)
         ledger[str(path)] = provision.file_identity(path, row)
         save(ledger_path, ledger)
         done += row['bytes']

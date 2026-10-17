@@ -10,7 +10,9 @@ export function createProgressConnection(api, consume, now = () => Date.now()) {
         // The graph may still be loading. Do not acknowledge an undelivered
         // snapshot; the next poll restores it once the node exists.
         const age = Number.isFinite(message.age_seconds) ? Math.max(0, message.age_seconds) : 0;
-        if (consume({...message, received_at: now() - age * 1000}) !== false)
+        // A heartbeat refreshes only the estimate: it is younger than the engine message.
+        const overallAge = Number.isFinite(message.overall_age_seconds) ? Math.max(0, message.overall_age_seconds) : age;
+        if (consume({...message, received_at: now() - age * 1000, overall_received_at: now() - overallAge * 1000}) !== false)
             seen.set(key, message);
     }
     async function refresh() {

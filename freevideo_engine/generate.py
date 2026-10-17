@@ -8,6 +8,7 @@ share the exclusive GPU-work lock and monitor the actual compute process.
 import argparse
 import json
 import os
+import re
 from pathlib import Path
 import signal
 import subprocess
@@ -55,7 +56,7 @@ def child(command, env, descriptor, log, *, ram_budget_bytes=None, gpu=None, on_
                 on_start(process.pid)
             if gpu:
                 from .monitoring import Monitor
-                monitor = Monitor(log.with_suffix('.gpu.csv'), device=gpu).start()
+                monitor = Monitor(log.with_suffix('.gpu.csv'), device=gpu, pid=process.pid).start()
             while process.poll() is None:
                 if memory:
                     sample = memory.sample(process.pid)
@@ -179,6 +180,9 @@ def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environ
             planning_canvas = dict(canvas)
             if getattr(args, 'task', None):
                 planning_canvas['task'] = args.task
+            if getattr(args, 'step_cache', None):
+                # The planner keeps the first-block cache only where it fits.
+                planning_canvas['step_cache'] = args.step_cache
             options.update(available_backends=available_backends(hardware, probe_missing=False), canvas=planning_canvas,
                 demonstrated_ram_bytes=demonstrated_local_ram(hardware, args, canvas))
             cache = getattr(args, 'cache', None)
@@ -296,6 +300,23 @@ def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environ
         os.environ.pop(ENV, None)
 
 
+def _runtime_libraries(error, record):
+    """Check the cuDNN files when this process saw them refused, or when the
+    hardware probe, which imports torch, failed. Workers check their own failures."""
+    try:
+        from .runtime_libraries import mismatch, diagnose
+        if mismatch(error) or getattr(error, 'torch_probe_failed', False):
+            record['runtime_libraries'] = diagnose()
+    except Exception:
+        pass
+
+
+def encoder_size_mismatch(encoding):
+    # Cache hits retain the checkpoint with the original request's metrics.
+    checkpoint = encoding.get('checkpoint') or (encoding.get('cache_source_metrics') or {}).get('checkpoint') or {}
+    return checkpoint.get('tested_size') is False
+
+
 def run(args):
     """Also retain admission/import failures before the main request starts."""
     output = Path(args.out).expanduser().resolve()
@@ -313,6 +334,7 @@ def run(args):
                 phase=planning[-1]['stage'] if planning else 'preflight', resource_planning=planning,
                 error_type=type(error).__name__, exception=exception_details(error),
                 error_message=str(error), resource_error=getattr(error, 'details', None), runtime_code=code_identity())
+            _runtime_libraries(error, record)
             try:
                 save(output.with_suffix('.request.json'), record)
                 write_debug(output, record)
@@ -321,18 +343,92 @@ def run(args):
         raise
 
 
+def dialogue_reason(prompt):
+    """Shared eligibility for opening-voice references and hidden dialogue tails."""
+    from .prompt_vlm.rules import split_source
+    if not prompt or not split_source(prompt)[2]:
+        return 'no_lines'
+    if re.search(r'(?i)\b(?:sing|sings|singing|sang|sung|lyrics)\b|唱', prompt):
+        return 'singing'
+    return None
+
+
+def hide_tail_geometry(canvas, prompt, requested=False, *, preview=False, max_frames=None):
+    """Plan the generated canvas while keeping the ordinary output duration."""
+    if not requested:
+        return canvas, None
+    from .continuation import HIDE_TAIL_FRAMES
+    from .geometry import geometry
+    # The product's longest selectable request is 60 seconds on the H3 grid.
+    limit = geometry(seconds=60)['frames'] if max_frames is None else max_frames
+    reason = 'preview' if preview else dialogue_reason(prompt)
+    if reason is None and canvas['frames'] + HIDE_TAIL_FRAMES > limit:
+        reason = 'too_long'
+    if reason is not None:
+        return canvas, dict(requested=True, used=False, reason=reason)
+    generated = dict(canvas, **geometry(canvas['width'], canvas['height'], frames=canvas['frames'] + HIDE_TAIL_FRAMES))
+    return generated, dict(requested=True, used=True, frames=HIDE_TAIL_FRAMES)
+
+
 def _run(args):
     from .hardware import detect
     from .geometry import geometry
+    from .continuation import (validate_frames, validate_route, prepare as prepare_continuation,
+                               summary as continuation_summary, validate_snapshot, persist_snapshot, restore_snapshot,
+                               audio_context, MISSING as CONTINUATION_MISSING)
+    from .continuation_tail import pending as encoded_continuation, freeze as freeze_tail
+    continuation_directory = continuation_first = None
+
+    def freeze_continuation(value):
+        from .paths import base_path
+        return freeze_tail(value, canvas, continuation_first, continuation_directory,
+                           profile['engine'].get('base') or base_path())
+
+    def usable_continuation(value, *check):
+        """The stored context when it fits this run, otherwise the previous video's own ending."""
+        if 'tail' in value:
+            return value
+        try:
+            return validate_snapshot(value, *check)
+        except ValueError as error:
+            if str(error) != CONTINUATION_MISSING:
+                raise
+        # A record of another version, other weights or another first-pass size.
+        value = dict(encoded_continuation(continue_from, canvas),
+                     **{key: value[key] for key in ('audio_context', 'source_video', 'anchor', 'pictures', 'sound') if key in value})
+        return freeze_continuation(value) if continuation_directory is not None else value
+
+    frames = getattr(args, 'frames', None)
+    continue_from = getattr(args, 'continue_from', None)
+    continue_anchor = getattr(args, 'continue_anchor', None)
+    if continue_anchor is not None and continue_from is None:
+        raise ValueError('--continue-anchor requires --continue-from')
+    # Every part of a long video is asked alike; only a part that continues another can use it.
+    first_frame = None
+    voice_reference = (dict(requested=True, used=False, reason=None)
+                       if getattr(args, 'voice_reference', False) and continue_from is not None else None)
+    if getattr(args, 'first_frame_reference', False) and continue_from is not None:
+        if continue_anchor is not None:
+            raise ValueError('Choose --first-frame-reference or --continue-anchor, not both')
+        first_frame = dict(requested=True, used=False)
+    if continue_from is not None and frames is not None:
+        validate_frames(frames)
     canvas = geometry(getattr(args, 'width', 1344), getattr(args, 'height', 768),
-                      frames=getattr(args, 'frames', None), seconds=getattr(args, 'seconds', None))
+                      frames=frames, seconds=getattr(args, 'seconds', None))
+    visible_canvas = canvas
+    canvas, hide_tail = hide_tail_geometry(canvas,
+        args.prompt_file.read_text(encoding='utf-8') if getattr(args, 'hide_tail', False) and args.prompt_file else None,
+        getattr(args, 'hide_tail', False),
+        preview=bool(getattr(args, 'preview', False) or getattr(args, 'refine_from', None)))
+    hide_tail_frames = hide_tail['frames'] if hide_tail and hide_tail['used'] else 0
+    continuation = None
     from .two_pass import validate_steps
     requested_steps = getattr(args, 'base_steps', None)
     refine_steps = getattr(args, 'refine_steps', 3)
     two_pass = getattr(args, 'two_pass', True)
     preview = getattr(args, 'preview', False) is True
     from .preview import validate_flags, source as preview_source
-    validate_flags(preview, getattr(args, 'refine_from', None), two_pass)
+    validate_flags(preview, getattr(args, 'refine_from', None), two_pass, requested_steps)
     refine_source = preview_source(args.refine_from) if getattr(args, 'refine_from', None) else None
     if requested_steps is not None:
         validate_steps(requested_steps, refine_steps, two_pass)
@@ -340,6 +436,78 @@ def _run(args):
             canvas['steps'] = requested_steps
     from .media_request import read as read_media, task_for, cache_key
     media = read_media(getattr(args, 'media', None))
+    if continue_anchor is not None:
+        from .continuation import anchor_media
+        media = anchor_media(media, continue_anchor)
+    # The cast's pictures, sent with a continued part like with a part that starts fresh.
+    pictures = []
+    if continue_from is not None and continue_anchor is None and media.get('references'):
+        from .continuation import continuation_pictures
+        pictures = continuation_pictures(media)
+    anchored = continue_anchor is not None or bool(pictures)
+    # Too small to sample cleanly: render larger, scale the picture down. Decided before anything
+    # compares or stores the canvas, so every later check sees the size that is sampled.
+    from .two_pass import sampling_canvas
+    canvas, output_size = sampling_canvas(canvas, staged=bool(preview or refine_source), media=media,
+                                          conditioned=bool(args.conditioning))
+    if continue_from is not None:
+        validate_route(task=getattr(args, 'task', None) or ('ref2va' if anchored else 't2va'),
+                       anchor=anchored, two_pass=two_pass,
+                       preview=preview, refine_from=getattr(args, 'refine_from', None), media=media)
+        # Reject absent/mismatched context before text encoding or model loading.
+        if getattr(args, 'continuation_snapshot', None):
+            continuation = restore_snapshot(args.continuation_snapshot,
+                getattr(args, 'continuation_snapshot_sha256', None), canvas)
+        else:
+            try:
+                continuation = prepare_continuation(continue_from, canvas)
+            except ValueError as error:
+                if str(error) != CONTINUATION_MISSING:
+                    raise
+                # Nothing was stored for this file: its own ending is encoded when the run starts.
+                continuation = encoded_continuation(continue_from, canvas)
+        continuation = dict(continuation, audio_context=audio_context(), source_video=str(continue_from))
+        if first_frame is not None and pictures:
+            # The cast's pictures already hold the people; the film's first frame is not added to them.
+            first_frame['reason'] = 'pictures'
+        elif first_frame is not None:
+            from .continuation import anchor_media, chain_first_frame_picture
+            try:
+                # A context encoded from the file carries no first frame; whoever planned this run saw none either.
+                kept = None if 'tail' in continuation else chain_first_frame_picture(continuation, continue_from)
+            except ValueError:
+                kept = None
+                first_frame['reason'] = 'unreadable'
+            if kept is None:
+                # Optional help: the part is made as an ordinary continuation and the report says why.
+                first_frame.setdefault('reason', 'source_predates')
+            else:
+                if args.out.resolve().exists():
+                    raise FileExistsError(args.out.resolve())
+                args.out.resolve().parent.mkdir(parents=True, exist_ok=True)
+                continue_anchor = args.out.resolve().with_suffix('.first-frame.png')
+                picture, picture_width, picture_height = kept
+                continue_anchor.write_bytes(picture)
+                media = anchor_media(media, continue_anchor)
+                validate_route(task=getattr(args, 'task', None) or 'ref2va', anchor=True, two_pass=two_pass,
+                               preview=preview, refine_from=getattr(args, 'refine_from', None), media=media)
+                first_frame.update(used=True, width=picture_width, height=picture_height)
+                anchored = True
+        if anchored:
+            continuation['anchor'] = media['references'][0]
+        if pictures:
+            continuation['pictures'] = len(pictures)
+        if voice_reference is not None:
+            if first_frame is not None and not pictures:
+                voice_reference['reason'] = 'first_frame'
+            elif continue_anchor is not None:
+                voice_reference['reason'] = 'anchor'
+            elif args.conditioning:
+                # Preencoded conditioning cannot take another reference.
+                voice_reference['reason'] = 'conditioning'
+            else:
+                voice_reference['reason'] = dialogue_reason(
+                    args.prompt_file.read_text(encoding='utf-8') if args.prompt_file else None)
     active_loras = [row for row in media.get('loras', []) if row['strength'] != 0]
     if media:
         inferred_task = task_for(media)
@@ -356,7 +524,21 @@ def _run(args):
         hardware, resident_credit = credit(detect())
         profile = json.loads(args.profile.read_text(encoding='utf-8'))
     else:
-        hardware, resident_credit, profile = automatic_profile(args, canvas, stage='before-encoding', evidence=planning)
+        from .policy import ResourceBudgetError
+        try:
+            hardware, resident_credit, profile = automatic_profile(args, canvas, stage='before-encoding', evidence=planning)
+        except ResourceBudgetError:
+            if not hide_tail_frames:
+                raise
+            # The optional tail must fit this size/step tier too. Re-admit the
+            # original duration before encoding anything; never shorten it.
+            canvas, output_size = sampling_canvas(dict(canvas, **visible_canvas),
+                staged=bool(preview or refine_source), media=media, conditioned=bool(args.conditioning))
+            hardware, resident_credit, profile = automatic_profile(args, canvas, stage='before-encoding', evidence=planning)
+            hide_tail, hide_tail_frames = dict(requested=True, used=False, reason='too_long'), 0
+            if continuation is not None:
+                from .continuation import OVERLAP_FRAMES
+                continuation = dict(continuation, new_frames=canvas['frames'] - OVERLAP_FRAMES)
     print(json.dumps(dict(event='compute_device', backend='ROCm' if hardware.hip_version else 'CUDA', name=getattr(hardware, 'gpu_name', None),
                           uuid=getattr(hardware, 'gpu_uuid', None), vram_total_bytes=getattr(hardware, 'vram_total', None),
                           vram_free_bytes=getattr(hardware, 'vram_free', None))), flush=True)
@@ -369,6 +551,8 @@ def _run(args):
     base_steps = requested_steps if requested_steps is not None else profile['engine'].get('steps', 8)
     validate_steps(base_steps, refine_steps, two_pass)
     profile['engine']['steps'] = base_steps
+    if args.profile and getattr(args, 'step_cache', None):
+        profile['engine']['step_cache'] = args.step_cache
     if 'engine' in profile.get('policy', {}):
         profile['policy']['engine']['steps'] = base_steps
     if base_steps != 8:
@@ -384,6 +568,14 @@ def _run(args):
     if args.out.suffix.lower() != '.mp4':
         raise ValueError('--out must name an MP4 file')
     manifest = json.loads((args.cache / 'manifest.json').read_text(encoding='utf-8'))
+    if continuation is not None:
+        from .two_pass import plan as continuation_plan
+        validate_route(task=profile['engine'].get('task', 't2va'), anchor=anchored)
+        planned = continuation_plan(canvas, two_pass, base_steps=base_steps, refine_steps=refine_steps)
+        if two_pass and not planned['enabled'] and base_steps != 8:
+            raise ValueError(planned['reason'] + ' A continuation needs two-pass generation.')
+        continuation_first = planned['first']
+        continuation = usable_continuation(continuation, canvas, None if active_loras else manifest, planned)
     if manifest.get('precision') not in ('fp8', 'int8', 'bf16'):  # BF16: the unquantized reference
         raise ValueError('Select the prepared official FP8 or int8 cache')
     destination = args.out.resolve()
@@ -392,10 +584,16 @@ def _run(args):
     destination.parent.mkdir(parents=True, exist_ok=True)
     artifacts = destination.with_suffix('.artifacts')
     artifacts.mkdir(exist_ok=False)
+    continuation_directory = artifacts
+    if continuation is not None and 'tail' in continuation:
+        continuation = freeze_continuation(continuation)
+    elif continuation is not None and 'snapshot' not in continuation:
+        continuation = persist_snapshot(continuation, artifacts / 'continuation-source.safetensors')
     if args.prompt_file:
         shutil.copyfile(args.prompt_file, artifacts / 'prompt.txt')
     repo = Path(__file__).resolve().parents[1]
     report = {'profile': profile, 'seed': args.seed, 'success': False, 'geometry': canvas,
+              **({'output_size': output_size} if output_size else {}),
               'resource_planning': planning,
               'artifacts': str(artifacts),
               'idle_resources': dict(automatic=not bool(args.profile), system=hardware.system,
@@ -404,6 +602,24 @@ def _run(args):
                   allocator_limit_bytes=allocator_limit_bytes),
               'reclaimable_resident_models': resident_credit,
               'encoder_mode': 'native H3 encoder library child' if args.prompt_file else 'preencoded shared conditioning'}
+    if continuation is not None:
+        report['continuation'] = continuation_summary(continuation, hide_tail_frames=hide_tail_frames)
+        if 'tail' in continuation:
+            report['continuation']['context'] = 'encoded'
+        report['audio_context'] = continuation['audio_context']
+        if continue_anchor is not None:
+            report['continue_anchor'] = continuation['anchor']
+        if pictures:
+            report['continue_pictures'] = len(pictures)
+    if first_frame is not None:
+        report['first_frame_reference'] = first_frame
+    if voice_reference is not None:
+        report['voice_reference'] = voice_reference
+    if hide_tail is not None:
+        report['hide_tail'] = hide_tail
+    if hide_tail_frames:
+        report['output_frames'] = (report['continuation']['new_frames'] if continuation is not None
+                                   else canvas['frames'] - hide_tail_frames)
     from .support_report import code_identity, write as write_debug
     report['runtime_hardware'] = hardware.to_dict()
     report['runtime_code'] = code_identity()
@@ -430,9 +646,41 @@ def _run(args):
                 report['lora'] = prepared['report']
                 args._lora_max_block_bytes = prepared['report'].get('max_block_bytes', 0)
                 args._lora_root_bytes = prepared['report'].get('root_bytes', 0)
+                if continuation is not None:
+                    continuation = usable_continuation(continuation, canvas,
+                        json.loads((args.cache / 'manifest.json').read_text(encoding='utf-8')))
+                    if 'tail' in continuation:
+                        report['continuation']['context'] = 'encoded'
                 if args._lora_max_block_bytes or args._lora_root_bytes:
                     profile.setdefault('policy', {})['lora_max_block_bytes'] = args._lora_max_block_bytes
                     profile['policy']['lora_root_bytes'] = args._lora_root_bytes
+            if voice_reference is not None and voice_reference['reason'] is None:
+                # Model identity, first-pass size and LoRA admission may have switched this
+                # request to tail encoding. Decide only after those checks, before encoding media.
+                if 'tail' in continuation:
+                    voice_reference['reason'] = 'source_predates'
+                else:
+                    from .continuation import chain_first_sound, unpack_first_sound
+                    try:
+                        kept = chain_first_sound(continuation, continue_from)
+                        sound = unpack_first_sound(kept) if kept is not None else None
+                    except ValueError:
+                        sound = None
+                    if sound is None:
+                        voice_reference['reason'] = 'unreadable'
+                    else:
+                        path = destination.with_suffix('.first-sound.wav')
+                        path.write_bytes(sound)
+                        from .media_request import digest
+                        # After the cast's pictures: the sound is the last reference.
+                        media = dict(media, version=1, references=[*media.get('references', []), dict(kind='audio',
+                                     path=str(path), sha256=digest(path), bytes=path.stat().st_size)])
+                        validate_route(task=getattr(args, 'task', None) or ('ref2va' if anchored else 't2va'), sound=True,
+                                       anchor=anchored, two_pass=two_pass,
+                                       preview=preview, refine_from=getattr(args, 'refine_from', None), media=media)
+                        continuation['sound'] = media['references'][-1]
+                        args.task = profile['engine']['task'] = task_for(media)
+                        voice_reference['used'] = True
             resource_identity = local_identity(hardware, args.cache)
             history = ResourceHistory(history_path())
             history.recover_pending()
@@ -487,7 +735,12 @@ def _run(args):
             elif args.conditioning:
                 shutil.copyfile(args.conditioning, condition)
             if args.prompt_file and not refine_source:
-                encoding = {'prompt': args.prompt_file.read_text(encoding='utf-8'), 'encoder': args.encoder,
+                prompt_text = args.prompt_file.read_text(encoding='utf-8')
+                if first_frame is not None and first_frame['used']:
+                    # The saved prompt stays the user's own; the model is also told what the picture is.
+                    from .continuation import first_frame_prompt
+                    prompt_text = first_frame_prompt(prompt_text)
+                encoding = {'prompt': prompt_text, 'encoder': args.encoder,
                             'comfy_root': str(args.comfy_root or comfy_root()),
                             'model_paths': str(args.model_paths.resolve()) if args.model_paths else None,
                             'output': str(condition), 'gpu_budget_gb': profile['gpu_budget_gb'],
@@ -496,15 +749,24 @@ def _run(args):
                             'diagnostic_output': str(destination)}
                 if media:
                     encoding.update(media=media, geometry=canvas, base=profile['engine'].get('base'))
+                # Lets the encoder child read the video model while it computes, on a slow drive.
+                from .model_read_ahead import request_fields
+                if getattr(args, 'cache', None):
+                    encoding.update(request_fields(args.cache, profile['engine'],
+                                                   budget_is_estimate=ram_budget_is_estimate(args)))
                 conditioning_key = cache_key(encoding['prompt'], media, canvas)
                 encode_request = temporary / 'encode.json'
                 encode_request.write_text(json.dumps(encoding) + '\n', encoding='utf-8')
                 cached = input_cache.get(conditioning_key, condition) if input_cache else None
-                if cached and (cached.get('success') is not True or cached.get('conditioning_shape', [])[1:] != [5120]):
+                if cached and encoder_size_mismatch(cached):
+                    cached = None
+                elif cached and (cached.get('success') is not True or cached.get('conditioning_shape', [])[1:] != [5120]):
                     condition.rename(condition.with_name('conditioning.cache-rejected-' + str(time.time_ns()) + '.pt'))
                     cached = None
                 if not cached and state and task_for(media) == 't2va':
                     cached = tuning.cached_conditioning(state, encoding['prompt'], condition)
+                    if cached and encoder_size_mismatch(cached):
+                        cached = None
                 if cached:
                     save(destination.with_suffix('.encoding.json'), cached)
                     destination.with_suffix('.encoding.log').write_text('Reused validated local text conditioning; encoder model was not loaded.\n', encoding='utf-8')
@@ -550,14 +812,15 @@ def _run(args):
                         'prompt_characters': len(encoding['prompt'])})
                 report['encoding'] = json.loads(destination.with_suffix('.encoding.json').read_text(encoding='utf-8'))
                 report['encoder_process_exited_before_video'] = not bool(os.environ.get('FREEVIDEO_RESIDENT_SESSION'))
-                if input_cache and not cached:
+                cacheable = not cached and not encoder_size_mismatch(report['encoding'])
+                if input_cache and cacheable:
                     try:
                         report['input_cache']['conditioning_saved'] = input_cache.put(conditioning_key, condition, report['encoding'])
                         if input_cache.note:
                             report['input_cache']['note'] = input_cache.note
                     except (OSError, ValueError) as error:
                         report['input_cache']['note'] = str(error)
-                if state and not cached and task_for(media) == 't2va':
+                if state and cacheable and task_for(media) == 't2va':
                     try:
                         tuning.remember_conditioning(state, encoding['prompt'], condition, report['encoding'])
                         tuning.save_state(state)
@@ -572,13 +835,23 @@ def _run(args):
                     if type(count) is not int or count < 0:
                         raise ValueError('Invalid reference token count')
                     canvas[name] = count
+                if 'early_reference' in info:
+                    canvas['early_reference'] = info['early_reference']
                 profile['engine']['task'] = info['task']
             if not condition.is_file():
                 raise FileNotFoundError(condition)
             from .two_pass import plan as plan_sampling, ensure_checkpoint
             sampling_plan = plan_sampling(canvas, two_pass, profile['engine'].get('task', 't2va'),
-                                          base_steps=base_steps, refine_steps=refine_steps)
+                                          base_steps=base_steps, refine_steps=refine_steps,
+                                          staged=bool(preview or refine_source))
             report['sampling_plan'] = sampling_plan
+            if continuation is not None:
+                validate_route(task=profile['engine'].get('task', 't2va'), anchor=anchored,
+                               **(dict(sound=True, media=media) if voice_reference and voice_reference['used'] else {}))
+                continuation = usable_continuation(continuation, canvas,
+                    json.loads((args.cache / 'manifest.json').read_text(encoding='utf-8')), sampling_plan)
+                if 'tail' in continuation:
+                    report['continuation']['context'] = 'encoded'
             if preview:
                 report['preview'] = dict(geometry=dict(sampling_plan['first'], fps=canvas['fps']))
             if refine_source:
@@ -668,9 +941,14 @@ def _run(args):
                        'gpu_budget_bytes': round(profile['gpu_budget_gb'] * 1e9), 'engine_options': profile['engine'],
                        'decoder_options': profile['decoder'], 'output': str(destination),
                        'geometry': canvas, 'artifacts': str(artifacts),
+                       **({'output_size': output_size} if output_size else {}),
                        'sampling_plan': sampling_plan, 'upscaler_checkpoint': upscaler_checkpoint,
                        'automatic_pass_cache': not bool(args.profile),
                        'metrics': str(destination.with_suffix('.engine.json'))}
+            if continuation is not None:
+                request['continuation'] = continuation
+            if hide_tail_frames:
+                request['hide_tail_frames'] = hide_tail_frames
             if preview:
                 request['preview'] = True
             if allocator_limit_bytes is not None:
@@ -691,8 +969,13 @@ def _run(args):
             def launch(selected, attempt):
                 nonlocal preview_pass
                 selected_env = inference_environment(engine_env, selected['inference_ram_budget_gb'] * 1e9)
+                if continuation is not None:
+                    from .continuation import ADALN_TASK, ANCHOR_ADALN_TASK
+                    selected['engine'] = dict(selected['engine'],
+                        adaln_task=ANCHOR_ADALN_TASK if anchored else ADALN_TASK)
                 request.update(engine_options=selected['engine'], decoder_options=selected['decoder'],
                                ram_budget_bytes=round(selected['inference_ram_budget_gb'] * 1e9),
+                               ram_budget_is_estimate=ram_budget_is_estimate(args),
                                gpu_budget_bytes=round(selected['gpu_budget_gb'] * 1e9),
                                gpu_reserve_bytes=selected.get('policy', {}).get('gpu_system_reserve_bytes', 0),
                                capacity_trial=bool(selected.get('policy', {}).get('capacity_trial')),
@@ -706,11 +989,20 @@ def _run(args):
                     request['automatic_pass_cache'] and getattr(args, 'gpu_reserve_gib', None) is None)
                 request['gpu_capacity_bytes'] = min(hardware.vram_total,
                     int(args.vram_gib * 2**30) if args.vram_gib else hardware.vram_total)
-                if request['automatic_pass_cache']:
-                    from .two_pass import first_pass_policy
+                from .two_pass import clamp_first_pass_for_retry, first_pass_policy, keeps_first_pass_on_retry
+                retry_keeps = (not args.profile and not request['automatic_pass_cache'] and keeps_first_pass_on_retry(
+                    report.get('resource_attempts'), getattr(args, 'resource_retries', 2)))
+                if request['automatic_pass_cache'] or retry_keeps:
                     first_policy = first_pass_policy(selected, canvas, sampling_plan)
                     if first_policy is not None:
                         first_policy['profile'], _ = apply_compatibility(first_policy['profile'], compatibility_state)
+                        if retry_keeps:
+                            # A recovery attempt narrows placement, not the first pass's arithmetic
+                            # partitions: keep those and never exceed what the retry frees.
+                            # With the pass cache off only the compute options (chunks, residual
+                            # offload, prefetch, recompute) take effect; the rest is diagnostic.
+                            first_policy, clamped = clamp_first_pass_for_retry(first_policy, selected)
+                            first_policy['retry_clamped'] = clamped
                         request['first_pass_policy'] = first_policy
                         report['first_pass_policy'] = first_policy
                 if resume_decode is not None:
@@ -723,9 +1015,9 @@ def _run(args):
                     request.pop('resume_refine', None)
                 request.pop('resume_first_pass', None)
                 if resume_decode is None and resume_refine is None and preview_pass is not None:
-                    from .decode_resume import refine_provenance
+                    from .decode_resume import refine_provenance, same_identity
                     receipt = json.loads(Path(preview_pass['metrics']).read_text(encoding='utf-8'))
-                    if refine_provenance(request) == receipt.get('refine_provenance'):
+                    if same_identity(refine_provenance(request), receipt.get('refine_provenance')):
                         request['resume_first_pass'] = dict(preview_pass)
                         report['upscaled_preview']['first_pass_reused'] = True
                     else:
@@ -737,8 +1029,10 @@ def _run(args):
                                    'its first pass was sampled again.')
                         print(json.dumps(dict(event='preview_mismatch')), flush=True)
                 save(request_path, request)
+                # The epoch pairs with the worker's own events to time its start.
                 print(json.dumps({'event': 'decode_resume' if resume_decode else 'video_start', 'resource_attempt': attempt,
-                                  'engine': selected['engine'], 'decoder': selected['decoder']}), flush=True)
+                                  'engine': selected['engine'], 'decoder': selected['decoder'],
+                                  'epoch': time.time()}), flush=True)
                 try:
                     telemetry = child([sys.executable, '-m', 'freevideo_engine.worker', '--request', str(request_path)],
                         selected_env, descriptor, destination.with_suffix('.engine.log'),
@@ -831,6 +1125,9 @@ def _run(args):
                 archive=archive, report=report, persist=persist, on_retry=retry,
                 automatic=not args.profile or getattr(args, 'recover_placement', False),
                 max_retries=getattr(args, 'resource_retries', 2))
+            if continuation is not None:
+                report['continuation']['audio_lead_in_samples'] = report['video'].get('continuation', {}).get(
+                    'audio_lead_in_samples', 0)
             if preview:
                 # An upscale validates this receipt beside the retained first pass.
                 shutil.copyfile(destination.with_suffix('.engine.json'), artifacts / 'first-pass.engine.json')
@@ -846,6 +1143,7 @@ def _run(args):
         report['error_type'] = type(error).__name__
         if hasattr(error, 'details'):
             report['resource_error'] = error.details
+        _runtime_libraries(error, report)
         if applied:
             report['tuning']['disabled_after_failure'] = tuning.disable_profile(applied, error)
         raise

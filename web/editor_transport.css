@@ -1,0 +1,26 @@
+/* Playback tools, shortcut sheet and timeline markers. */
+.fv-ed-fullscreen-host{display:contents}
+.fv-ed-transport-tools{display:flex;align-items:center;gap:4px;margin-left:auto}
+.fv-ed-transport{justify-content:flex-start;padding:0 16px}
+.fv-editor .fv-ed-transport-tools button,.fv-editor .fv-ed-shortcuts,.fv-editor .fv-ed-snapping{width:32px;height:32px;min-height:32px;padding:0;border-color:transparent;background:transparent}
+.fv-ed-transport-tools svg,.fv-ed-toolbar .fv-ed-marker svg,.fv-ed-toolbar .fv-ed-snapping svg,.fv-ed-toolbar .fv-ed-shortcuts svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.4;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.fv-editor .fv-ed-transport-tools button[aria-pressed=true],.fv-editor .fv-ed-snapping[aria-pressed=true]{color:var(--fv-accent);background:color-mix(in srgb,var(--fv-accent) 12%,transparent)}
+.fv-editor .fv-ed-transport-tools button:disabled{opacity:.4}
+.fv-ed-toolbar>.fv-ed-snapping{margin-left:auto;flex:none}
+.fv-ed-toolbar>.fv-ed-zoom{margin-left:0}
+.fv-ed-shortcut-sheet{position:absolute;right:16px;bottom:280px;z-index:12;max-height:min(560px,65dvh);width:360px;max-width:calc(100% - 32px);overflow:auto;background:var(--fv-card);border:1px solid var(--fv-border);border-radius:8px;padding:12px;box-shadow:0 8px 24px #0003}
+.fv-ed-shortcut-sheet table{width:100%;font-size:12px;border-collapse:collapse}
+.fv-ed-shortcut-sheet caption{text-align:left;font-size:14px;margin-bottom:8px}
+.fv-ed-shortcut-sheet td{padding:5px 3px;text-align:left;border-bottom:1px solid var(--fv-border)}
+.fv-ed-shortcut-sheet td:first-child{white-space:nowrap;color:var(--fv-muted);padding-right:12px}
+.fv-ed-marker-layer{position:absolute;left:0;right:0;top:0;height:24px;z-index:7;pointer-events:none}
+.fv-editor .fv-ed-timeline-marker,.fv-ed-track-view .fv-ed-timeline-marker{position:absolute;top:12px;transform:translateX(-50%);width:12px;height:12px;min-height:0;padding:0;border:0;border-radius:0;background:var(--fv-accent);clip-path:polygon(50% 0,100% 50%,50% 100%,0 50%);pointer-events:auto;cursor:ew-resize;touch-action:none}
+.fv-ed-timeline-marker[aria-pressed=true]{filter:brightness(1.4);outline:2px solid var(--fv-ink);outline-offset:2px}
+.fv-ed-fullscreen-host:fullscreen{display:grid;grid-template-rows:minmax(0,1fr) 48px;background:var(--fv-bg);color:var(--fv-ink);width:100%;height:100%;font:13px var(--fv-font)}
+.fv-ed-fullscreen-host:fullscreen .fv-ed-preview{grid-column:1;grid-row:1;width:100%;height:100%;padding:16px;margin-right:0}
+.fv-ed-fullscreen-host:fullscreen .fv-ed-transport{grid-column:1;grid-row:2;margin-right:0}
+@media(max-width:680px){.fv-ed-transport{padding:0 12px;gap:8px}.fv-ed-transport-tools{gap:2px}.fv-ed-time{min-width:80px;font-size:12px}.fv-ed-shortcut-sheet{bottom:280px}}
+/* Backward playback has no sound; the note sits in the transport row and shows only while it runs backward. */
+.fv-ed-reverse-note{font-size:12px;color:var(--fv-muted);white-space:nowrap}
+.fv-ed-transport:not([data-rate="-1"]) .fv-ed-reverse-note{display:none}
+.fv-ed-timeline-marker[data-blocked=true]{opacity:.45;cursor:not-allowed}

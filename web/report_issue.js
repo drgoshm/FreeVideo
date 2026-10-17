@@ -39,15 +39,61 @@ export function reportIssueURL(report, productVersion = null) {
 // Each download is named by when it was saved, so saving reports again never
 // leaves "video.debug (1).json"-style copies; the card names the file just saved.
 let savedName = null;
-export function reportFileName(date = new Date()) {
+export function reportFileName(date = new Date(), extension = 'json') {
     const pad = value => String(value).padStart(2, '0');
     return `FreeVideo-report-${date.getFullYear()}${pad(date.getMonth() + 1)}${pad(date.getDate())}`
-        + `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}.json`;
+        + `-${pad(date.getHours())}${pad(date.getMinutes())}${pad(date.getSeconds())}.${extension}`;
 }
 
-export function saveReport(blob) {
-    const url = URL.createObjectURL(blob);
-    savedName = reportFileName();
+// A report larger than this is saved as a zip with the same name.
+export const ZIP_THRESHOLD = 512 * 1024;
+
+const CRC_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1; table[n] = c >>> 0; }
+    return table;
+})();
+function crc32(bytes) {
+    let c = 0xffffffff;
+    for (let i = 0; i < bytes.length; i++) c = CRC_TABLE[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+}
+async function deflate(bytes) {
+    if (typeof CompressionStream !== 'function') return null;
+    try {
+        const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('deflate-raw'));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+    } catch { return null; }
+}
+
+// One file in a zip: deflated when the browser can, stored otherwise.
+export async function zipReport(blob, name) {
+    const data = new Uint8Array(await blob.arrayBuffer());
+    const packed = await deflate(data);
+    const body = packed && packed.length < data.length ? packed : data, method = body === data ? 0 : 8;
+    const file = new TextEncoder().encode(name), crc = crc32(data);
+    const local = new DataView(new ArrayBuffer(30)), central = new DataView(new ArrayBuffer(46)), end = new DataView(new ArrayBuffer(22));
+    local.setUint32(0, 0x04034b50, true); local.setUint16(4, 20, true); local.setUint16(6, 0x0800, true); local.setUint16(8, method, true);
+    local.setUint16(12, 0x21, true); // 1980-01-01, so the file is the same each time
+    local.setUint32(14, crc, true); local.setUint32(18, body.length, true); local.setUint32(22, data.length, true); local.setUint16(26, file.length, true);
+    central.setUint32(0, 0x02014b50, true); central.setUint16(4, 20, true); central.setUint16(6, 20, true); central.setUint16(8, 0x0800, true);
+    central.setUint16(10, method, true); central.setUint16(14, 0x21, true); central.setUint32(16, crc, true);
+    central.setUint32(20, body.length, true); central.setUint32(24, data.length, true); central.setUint16(28, file.length, true);
+    const centralSize = 46 + file.length, centralStart = 30 + file.length + body.length;
+    end.setUint32(0, 0x06054b50, true); end.setUint16(8, 1, true); end.setUint16(10, 1, true);
+    end.setUint32(12, centralSize, true); end.setUint32(16, centralStart, true);
+    return new Blob([local, file, body, central, file, end], {type: 'application/zip'});
+}
+
+// Saves the report; a large one goes into a zip first. Resolves to the file name.
+export async function saveReport(blob) {
+    const date = new Date();
+    let name = reportFileName(date), out = blob;
+    if (blob.size > ZIP_THRESHOLD) {
+        try { out = await zipReport(blob, name); name = reportFileName(date, 'zip'); } catch { out = blob; }
+    }
+    const url = URL.createObjectURL(out);
+    savedName = name;
     const link = document.createElement('a'); link.href = url; link.download = savedName;
     document.body.append(link); link.click(); link.remove();
     setTimeout(() => URL.revokeObjectURL(url), 1000);
@@ -59,7 +105,7 @@ export function saveReport(blob) {
 // saved file in. Resolves to the form's address.
 export async function reportIssue(fetchReport, productVersion = null, {save = true, open = url => window.open(url, '_blank', 'noopener')} = {}) {
     const blob = await fetchReport();
-    if (save) saveReport(blob);
+    if (save) await saveReport(blob);
     let report = null;
     try { report = JSON.parse(await blob.text()); } catch { /* The form still opens, without prefilled fields. */ }
     const address = reportIssueURL(report, productVersion);
@@ -129,7 +175,10 @@ export function showReportTip(bar, anchor, t, {mode = 'invite', submit, onHide =
         tip.classList.add('fv-report-tip-sent'); anchor.classList.remove('fv-report-attention');
         mark.replaceChildren(glyph('done'));
         title.textContent = t('Last step', '最后一步');
-        lead.textContent = savedName
+        lead.textContent = savedName?.endsWith('.zip')
+            ? t(`The report is large, so it was saved as ${savedName}. Please drag it into "Diagnostic report", then select Submit new issue.`,
+                `报告较大，已保存为 ${savedName}。请将它拖入「诊断报告」，再点击 Submit new issue 即可。`)
+            : savedName
             ? t(`Please drag ${savedName} into "Diagnostic report", then select Submit new issue.`,
                 `请将 ${savedName} 拖入「诊断报告」，再点击 Submit new issue 即可。`)
             : t('Please drag the downloaded report into "Diagnostic report", then select Submit new issue.',

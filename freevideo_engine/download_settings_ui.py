@@ -1,7 +1,7 @@
 """Native download controls, usable before ComfyUI or the engine is installed."""
 from pathlib import Path
 
-from .download_settings import CHOICES, MODES, Probe, read, speed_text
+from .download_settings import CHOICES, MODES, SPEED_TEST_FAILED, Probe, read, speed_text
 
 
 class DownloadSettings:
@@ -55,8 +55,8 @@ class DownloadSettings:
             self.speeds.heading(key, text=self.t(en, cn)); self.speeds.column(key, width=width, minwidth=80)
         self.speeds.pack(fill='both', expand=True)
         ttk.Label(body, text=self.t(
-            'Switch applies to the current download. Compatible fragments resume; otherwise this file restarts, keeping old fragments on disk. Testing speeds does not switch sources.',
-            '切换立即作用于当前下载。兼容断点会续传；不兼容时当前文件重新下载，旧片段保留。仅测速不会切换。'),
+            'Switching takes effect at once. Downloads resume where possible; otherwise the file restarts. Testing speeds does not switch.',
+            '切换后马上生效，能续传的接着下载，不能的重新下载这个文件。只测速不会切换。'),
             wraplength=560, style='Muted.TLabel').pack(fill='x', pady=(12, 4))
         ttk.Label(body, text=str(self.root), wraplength=560, style='Muted.TLabel').pack(fill='x')
         ttk.Button(body, text=self.t('Done', '完成'), command=window.destroy).pack(anchor='e', pady=(8, 0))
@@ -120,7 +120,8 @@ class DownloadSettings:
             self.status.set(self.t('Testing sources… ', '正在测速… ') +
                             ('%s/%s · %s' % (progress.get('done', 0), progress.get('total', '?'), progress.get('source', ''))))
         elif state.get('error'):
-            self.status.set(state['error'])
+            self.status.set(self.t(SPEED_TEST_FAILED, '测速没有完成，请点“重新测速”。')
+                            if state['error'] == SPEED_TEST_FAILED else state['error'])
         elif state.get('network_unavailable'):
             self.status.set(self.t('No sources reachable. Check your network or connection mode.', '下载源均无法连接，请检查网络或切换连接模式。'))
         measured = value.get('probe')
@@ -128,18 +129,18 @@ class DownloadSettings:
             self.rendered = measured
             self.speeds.delete(*self.speeds.get_children())
             families = {'edge-models': self.t('Video model', '视频模型'), 'vdn-models': self.t('Decoder', '解码器'),
-                        'models': self.t('Text encoder', '文本编码器'), 'pypi': self.t('Python packages', 'Python 依赖'),
+                        'models': self.t('Prompt model', '提示词模型'), 'pypi': self.t('Python packages', 'Python 依赖'),
                         'github': self.t('Tools', '安装工具'), 'git': 'Git', 'cuda': 'CUDA'}
             for family, rows in (measured or {}).get('sources', {}).items():
                 if family.startswith('torch-'):
                     families[family] = self.t('GPU packages', 'GPU 依赖')
                 for row in rows:
                     speed = speed_text(row, self.zh)
-                    route = self.t('direct', '直连') if row.get('route') == 'direct' else self.t('current connection', '当前连接')
+                    route = self.t('Direct', '直连') if row.get('route') == 'direct' else self.t('Current connection', '当前连接')
                     self.speeds.insert('', 'end', values=(families.get(family, family), row['id'] + ' · ' + route, speed))
             if measured and not busy and not state.get('network_unavailable'):
-                self.status.set(self.t('HTTP transfer measured without connection wait. Parallel/Xet downloads may differ. Choose a source above to switch.',
-                    '测速已扣除连接等待；多线程／Xet 下载速度可能不同。在上方选择下载源即可切换。'))
+                self.status.set(self.t('Speeds are a guide. Choose a source above to switch.',
+                    '测速只作参考。在上方选择下载源来切换。'))
 
     def poll(self):
         try:

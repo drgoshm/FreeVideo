@@ -25,6 +25,8 @@ def read(path):
     value = json.loads(path.read_text(encoding='utf-8'))
     if not isinstance(value, dict) or value.get('version') != 1:
         raise ValueError('Expected a version 1 FreeVideo media request')
+    if 'early_steps' in value:
+        raise ValueError('early_steps is only allowed on video references')
     if set(value) - {'version', 'first', 'last', 'references', 'loras', 'conditioning_info'}:
         raise ValueError('Unknown media request fields')
     result = {'version': 1}
@@ -42,14 +44,18 @@ def read(path):
         if value.get(anchor):
             result[anchor] = file_info(value[anchor])
     for field in ('references', 'loras'):
-        entries = value.get(field, [])
+        entries = value.get(field)
+        if entries is None:
+            entries = []
         if not isinstance(entries, list) or len(entries) > 32:
             raise ValueError('At most 32 ' + field + ' per request')
         result[field] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 raise ValueError('Invalid ' + field + ' entry')
-            allowed = {'path', 'kind'} if field == 'references' else {'path', 'strength', 'alpha'}
+            if field != 'references' and 'early_steps' in entry:
+                raise ValueError('early_steps is only allowed on video references')
+            allowed = {'path', 'kind', 'early_steps'} if field == 'references' else {'path', 'strength', 'alpha'}
             if set(entry) - allowed:
                 raise ValueError('Unknown ' + field + ' fields')
             row = file_info(entry.get('path'))
@@ -57,6 +63,9 @@ def read(path):
                 if entry.get('kind') not in ('image', 'video', 'audio'):
                     raise ValueError('Reference kind must be image, video or audio')
                 row['kind'] = entry['kind']
+                if 'early_steps' in entry:
+                    validate_early_steps(entry)
+                    row['early_steps'] = entry['early_steps']
             else:
                 if Path(row['path']).suffix.lower() != '.safetensors':
                     raise ValueError('LoRA requires safetensors; pickle adapters are not loaded')
@@ -80,11 +89,29 @@ def read(path):
 def task_for(media):
     if media.get('conditioning_info'):
         return media['conditioning_info']['task']
-    if media.get('references'):
+    if any(row.get('early_steps') != 0 for row in media.get('references', [])):
         return 'ref2va'
     if media.get('first') and media.get('last'):
         return 'fl2va'
     return 'i2va' if media.get('first') else 'l2va' if media.get('last') else 't2va'
+
+
+def validate_early_steps(row):
+    if row.get('kind') != 'video':
+        raise ValueError('early_steps is only allowed on video references')
+    if type(row['early_steps']) is not int or row['early_steps'] < 0:
+        raise ValueError('Video reference early_steps must be an integer >= 0')
+
+
+def reference_stages(media):
+    """Active references at each boundary; zero-step inputs never reach an encoder."""
+    refs = media.get('references', [])
+    for row in refs:
+        if 'early_steps' in row:
+            validate_early_steps(row)
+    boundaries = sorted({0} | {row['early_steps'] for row in refs if 'early_steps' in row})
+    return [(step, dict(media, references=[row for row in refs
+             if 'early_steps' not in row or step < row['early_steps']])) for step in boundaries]
 
 
 def cache_key(prompt, media, canvas):

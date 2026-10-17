@@ -14,11 +14,14 @@ CUDA_FILES = ('first-pass.pt', 'first-pass.engine.json', 'video.json', 'conditio
 MAC_FILES = ('first-pass.pt', 'first-pass.json', 'engine-request.json', 'conditioning.pt')
 
 
-def validate_flags(preview, refine_from, two_pass):
+def validate_flags(preview, refine_from, two_pass, base_steps=None):
     if preview and refine_from:
         raise ValueError('Choose either a preview or an upscale of one, not both')
     if (preview or refine_from) and not two_pass:
         raise ValueError('Previews and their upscale use two-pass generation')
+    if preview and base_steps not in (None, 8):
+        # Two-pass runs only with 8 first-pass steps (two_pass.TWO_PASS_BASE_STEPS).
+        raise ValueError('A preview uses two-pass generation, which runs only with 8 first-pass steps')
 
 
 def source(output, native=False):
