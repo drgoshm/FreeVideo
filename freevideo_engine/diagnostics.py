@@ -25,6 +25,7 @@ FILE_LIMIT = 512 * 1024
 TOTAL_LIMIT = 12 * 1024 * 1024
 FILE_COUNT = 256
 NAMES = {'report.json', 'report.csv', 'inventory.json', 'case.json', 'status.json',
+         'prompt-rewrite.json',
          'plan.json', 'machine.before.json', 'comparison.json', 'profile.json',
          'result.json', 'gpu.csv', 'ram.jsonl', 'network.jsonl', 'optimization.json', 'storage.json', 'kernel-capabilities.json'}
 SENSITIVE = re.compile(r'(?:^|[_-])(?:token|password|secret|credential|api[_-]?key)(?:$|[_-])', re.I)
@@ -199,6 +200,40 @@ def latest(root, category):
     return max(directories, key=lambda p: p.name) if directories else None
 
 
+def web_files(root, machine):
+    """FreeVideo's page files in the source ComfyUI served, against that source's manifest."""
+    sources = []
+    try:
+        sources.append(json.loads((root / 'logs/page-check.json').read_text(encoding='utf-8')).get('source'))
+    except (OSError, ValueError, AttributeError):
+        pass
+    sources.append(machine.get('source'))
+    for source in sources:
+        if not isinstance(source, str) or not source:
+            continue
+        source = Path(source)
+        try:
+            rows = json.loads((source / 'launcher-source.json').read_text(encoding='utf-8'))['sha256']
+            rows = rows if isinstance(rows, dict) else None
+        except (OSError, ValueError, KeyError, TypeError):
+            rows = None
+        if not (source / 'web').is_dir():
+            return dict(source=str(source), error='The web folder is missing')
+        present = {p.relative_to(source).as_posix(): p for p in (source / 'web').rglob('*') if p.is_file()}
+        expected = {k: v for k, v in (rows or {}).items() if k.startswith('web/')}
+        changed = []
+        for name in sorted(set(expected) & set(present)):
+            try:
+                if hashlib.sha256(present[name].read_bytes()).hexdigest() != expected[name]:
+                    changed.append(name)
+            except OSError:
+                changed.append(name)
+        return dict(source=str(source), manifest=rows is not None, files=len(present),
+                    missing=sorted(set(expected) - set(present)), changed=changed,
+                    extra=sorted(set(present) - set(expected)) if rows is not None else [])
+    return dict(error='No FreeVideo source is recorded')
+
+
 def collect(root, config, run, output, *, complete=False, extra_files=(), notes=''):
     root, config = root.expanduser().resolve(), config.expanduser().absolute()
     if run is not None and (not run.is_dir() or is_link(run)):
@@ -254,6 +289,14 @@ def collect(root, config, run, output, *, complete=False, extra_files=(), notes=
         kernels = root / 'kernel-capabilities.json'
         if kernels.is_file():
             add_path('installation/kernel-capabilities.json', kernels)
+        prompt_report = root / 'prompt-vlm-report.json'
+        if prompt_report.is_file():
+            add_path('installation/prompt-vlm-report.json', prompt_report)
+        prompt_runs = root / 'prompt-vlm-runs'
+        if prompt_runs.is_dir() and not is_link(prompt_runs):
+            for path in sorted(prompt_runs.glob('*/prompt-rewrite.json'), key=lambda p: p.stat().st_mtime, reverse=True):
+                if not is_link(path) and not is_link(path.parent):
+                    add_path('prompt-vlm/' + path.parent.name + '.json', path)
         if tuning_state.is_file():
             add_path('installation/tuning.json', tuning_state)
         download_ownership = root / '.freevideo/downloaded-models.json'
@@ -337,6 +380,13 @@ def collect(root, config, run, output, *, complete=False, extra_files=(), notes=
                 for path in report_files(host_run):
                     add_path('launcher/host-runs/' + host_run.name + '/' +
                              path.relative_to(host_run).as_posix(), path)
+        # What the browser page found (web/health.js), and the page files of the
+        # source ComfyUI served: a missing or changed file explains a page
+        # without FreeVideo's styles or workspace.
+        for name in ('page-check.json', 'page-checks.jsonl'):
+            if (root / 'logs' / name).is_file():
+                add_path('logs/' + name, root / 'logs' / name)
+        add('source/web-files.json', json.dumps(web_files(root, machine)).encode())
         add_path('source/dependencies.json', Path(__file__).with_name('dependencies.json'))
         source = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path(__file__).parent.glob('*.py'))}
         add('source/hashes.json', json.dumps(source).encode())

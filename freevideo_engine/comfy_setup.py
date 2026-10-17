@@ -55,7 +55,9 @@ def discover_libraries(folder_paths, environ=None):
                 existing.append(str(path))
         except (OSError, RuntimeError):
             pass
-    return library_roots(existing)
+    # A folder registered under several model types is listed once; finding
+    # more than 64 folders keeps the first 64 rather than failing setup.
+    return library_roots(list(dict.fromkeys(existing)), keep_first=True)
 
 
 # The calibration encodes this once and every variant reads it, so the
@@ -236,11 +238,16 @@ class Setup:
         extra = value.get('extra_libraries', [])
         if not isinstance(extra, list) or not isinstance(value.get('copy', False), bool):
             raise ValueError('Invalid setup choices')
-        libraries = library_roots(discover_libraries(self.folder_paths) + extra)
+        # Folders the user chose are validated and kept first; folders found
+        # automatically fill the remaining places.
+        chosen = library_roots(extra)
+        libraries = library_roots(chosen + discover_libraries(self.folder_paths), keep_first=True)
         self.logs.mkdir(parents=True, exist_ok=True)
         manifest = self.logs / ('libraries-' + uuid.uuid4().hex + '.json')
         save(manifest, dict(version=1, roots=libraries))
-        arguments = ['setup', '--reuse-models-manifest', str(manifest)]
+        # A download that cannot resume (for example a Xet partial) starts again
+        # instead of pausing every retry; the old partial is set aside.
+        arguments = ['setup', '--reuse-models-manifest', str(manifest), '--allow-model-restart']
         frontend = value.get('frontend')
         if frontend:
             arguments += ['--frontend-root', str(Path(frontend['root']).expanduser().resolve())]
@@ -250,6 +257,8 @@ class Setup:
                 arguments.append('--frontend-download')
         if isinstance(value.get('sampling_caches'), bool):
             arguments.append('--sampling-caches' if value['sampling_caches'] else '--no-sampling-caches')
+        if value.get('prepared_format') in ('int8', 'fp8'):
+            arguments += ['--prepared-format', value['prepared_format']]
         if value.get('copy'):
             arguments.append('--copy-existing-models')
         self.selection = dict(root=str(root), arguments=arguments)

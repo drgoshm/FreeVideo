@@ -3,6 +3,7 @@ import json
 import logging
 import math
 from pathlib import Path, PurePosixPath, PureWindowsPath
+from .monitoring import thermal_slowdown
 
 
 def saved_video(output, output_directory):
@@ -152,10 +153,15 @@ def output_summary(report, relative_video):
                 gpu_total_bytes=report.get('profile', {}).get('policy', {}).get('hardware', {}).get('vram_total'),
                 geometry=report.get('geometry', {}),
                 sampling_plan=report.get('sampling_plan'),
+                low_memory=bool(report.get('low_memory_mode')),
+                thermal=thermal_slowdown(((report.get('memory') or {}).get('video') or {}).get('gpu')),
                 reference_trims=report.get('encoding', {}).get('reference_trims') or [],
+                preview=bool(report.get('preview')), upscaled_preview=bool(report.get('upscaled_preview')),
                 video=relative_video.as_posix(), report=relative_video.with_suffix(
                     '.debug.json' if report.get('diagnostic_file') == relative_video.with_suffix('.debug.json').name
                     else '.request.json').as_posix())
+    if report.get('preview'):
+        result['preview_geometry'] = report['preview'].get('geometry')
     if report.get('device_backend') == 'mps':
         policy = report.get('profile', {}).get('policy', {})
         hardware = report.get('runtime_hardware', {})

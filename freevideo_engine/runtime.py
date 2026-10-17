@@ -79,7 +79,7 @@ class Engine:
             self.weight_cache_headroom_bytes += residual_host_headroom(self.canvas)
         base = base_path() if base is None else Path(base)
         checkpoint = checkpoint_path() if checkpoint is None else Path(checkpoint)
-        if linear_compute not in ('native-fp8', 'bf16-weight-only'):
+        if linear_compute not in ('native-fp8', 'bf16-weight-only', 'int8'):
             raise ValueError('Unknown linear compute policy')
         if min(query_chunk, ff_chunk, head_chunk, projection_chunk) < 0:
             raise ValueError('Chunk sizes cannot be negative; zero disables chunking')
@@ -331,16 +331,10 @@ class Engine:
                         raise ValueError('FP8 FF chunks require the official inference kernels')
                     self.device_backend.install_chunked_ff(block.ff, ff_chunk, recompute=fp8_ff_recompute)
                     continue
+                from .blocks import chunked_ff
                 original = block.ff.forward
                 block.ff._freevideo_unchunked_forward = original
-
-                def chunked(ff, hidden, *args, original=original, **kwargs):
-                    output = torch.empty_like(hidden)
-                    for start in range(0, hidden.shape[-2], ff_chunk):
-                        output[..., start:start + ff_chunk, :] = original(hidden[..., start:start + ff_chunk, :], *args, **kwargs)
-                    return output
-
-                block.ff.forward = types.MethodType(chunked, block.ff)
+                block.ff.forward = types.MethodType(chunked_ff(original, ff_chunk), block.ff)
         if projection_chunk:
             from .packing import install_streamed_forward
             install_streamed_forward(model, projection_chunk, residual_offload=residual_offload)
@@ -417,6 +411,9 @@ class Engine:
         fa4_module = sys.modules.get('flash_attn.cute.flash_fwd')
         fa4_path = Path(fa4_module.__file__).resolve() if fa4_module is not None else None
         self.config = {'device_backend': self.device_backend.capabilities.name, 'task': task, 'attention': attention, 'prefetch': prefetch, 'adaln_cache': adaln_cache,
+                       'rocm_spatial_conv': os.environ.get('FREEVIDEO_ROCM_SPATIAL_CONV', 'miopen') if torch.version.hip else None,
+                       'rocm_attention': os.environ.get('FREEVIDEO_ROCM_ATTENTION', 'aotriton') if torch.version.hip else None,
+                       'rocm_ffn': os.environ.get('FREEVIDEO_ROCM_FFN', 'default') if torch.version.hip else None,
                        'adaln_mode': ('portable-model-asset' if table_cache is not None and table_cache.asset else
                                       'optional-model-asset' if table_cache is not None and table_cache.optional_loaded else
                                       'local-precompute' if adaln_cache else 'original-projections'),
@@ -653,6 +650,8 @@ class Engine:
                                 for key, count in self.attention.backend_calls.items()} if attention_before is not None else None),
                            'fp8_kernel_calls': ({key: count - gemm_before[key]
                                 for key, count in execution_counts().items()} if gemm_before is not None else None),
+                           'rocm_ff_chunks': (sorted({getattr(block.ff.forward, '_freevideo_rocm_chunk', self.config['ff_chunk'])
+                                                    for block in self.transformer.transformer_blocks}) if torch.version.hip else None),
                            'head_execution': dict(requested_parallelism=self.config.get('head_parallelism', 1),
                                **{name: getattr(self.attention, name, 0) - count
                                   for name, count in parallel_before.items()}),

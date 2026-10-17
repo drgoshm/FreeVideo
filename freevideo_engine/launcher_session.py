@@ -16,12 +16,14 @@ from .model_status import FAMILIES, NAMES
 from .model_guidance import package_instructions, video_instructions, runtime_packages_supported
 from .setup_progress import progress_text
 from .terminal_ui import clean, duration
+from .model_upgrade import TARGET
 
 # Background launcher release checks while the window stays open.
 CHECK_SECONDS = 30 * 60
 # "Later" hides one reminder for this long; a newer release reminds at once.
 SNOOZE_SECONDS = 4 * 3600
 QUEUE_POLL_SECONDS = 3
+RECEIPT_POLL_SECONDS = 5
 
 
 class Session:
@@ -32,20 +34,29 @@ class Session:
     update_waiting = update_restarting = False
     engine_updating = engine_autoinstall = reload_expected = resume_pages = False
     browser_wait = queue_state = queue_thread = bridge = None
-    clients_polled = queue_polled = resume_until = resume_polled = bridge_polled = 0.
+    foreign_state = foreign_thread = None
+    clients_polled = queue_polled = foreign_polled = receipt_polled = resume_until = resume_polled = bridge_polled = 0.
     bridge_pending = False
     bridge_written = (0., None)
     update_checked = 0.
     page = 'comfy'
     selected = installed_versions = None
     release_details = None
+    # The source whose earlier copies were removed once ComfyUI ran it.
+    old_versions_retired = None
 
     def __init__(self, source=None, *, controller=None, store=None, updater=None, smoke=False):
         from .offline_packages import Importer
+        from .installation_cleanup import Cleaner
+        from .model_upgrade import ModelUpgrade
+        self.cleaner = Cleaner()
         self.importer = Importer()
         self.imported_batch = None
+        self.import_retry = None
         self.source = Path(source or materialize_source())
         self.controller = controller or Controller(self.source)
+        self.upgrade = ModelUpgrade(self.source)
+        self.model_switch = None
         self.store = store or Store(launcher_root())
         saved = self.store.read()
         home = Path(os.environ.get('USERPROFILE') or os.environ.get('HOME') or launcher_root().parent)
@@ -78,6 +89,11 @@ class Session:
         self.model_groups = []
         self.browser_attempted = False
         self.browser_error = ''
+        # What the opened page reported about loading FreeVideo (web/health.js).
+        from .page_check import PageCheck
+        self.page_check = PageCheck()
+        self.browser_opened = None
+        self.page_error = ''
         self.started = None
         self.closing = False
         self.smoke = smoke
@@ -150,7 +166,7 @@ class Session:
                 raise ValueError(self.t('Pause installation before changing the token.', '请先暂停安装，再修改 Token。'))
             from .hf_auth import validate
             self.token = validate(str(value)); return
-        if key not in self.form or self.controller.busy or self.importer.busy:
+        if key not in self.form or self.controller.busy or self.importer.busy or self.cleaner.busy:
             return
         if key in ('separate', 'repair', 'new_comfy', 'sampling_caches'):
             value = bool(value)
@@ -164,6 +180,13 @@ class Session:
         if self.form[key] == value:
             return
         self.form[key] = value
+        if key in ('new_comfy', 'destination', 'comfy'):
+            # A remembered installation's engine belongs to that installation;
+            # another location installs into its own FreeVideo-engine.
+            self.form['engine'] = os.environ.get('FREEVIDEO_HOME') or ''
+        self.import_retry = None
+        self.cleaner.plan = None
+        self.cleaner.state = dict(status='idle', bytes=0, error='')
         self.controller.selection = None
         self.controller.state = dict(status='idle')
         self.browser_attempted = False
@@ -172,7 +195,9 @@ class Session:
 
     def add_folder(self, folder):
         from .local_models import library_roots
-        self.edit('model_dirs', library_roots(self.form['model_dirs'] + [folder]))
+        # Saved folders that were deleted since are dropped instead of blocking the new one.
+        kept = [p for p in self.form['model_dirs'] if Path(p).expanduser().is_dir()]
+        self.edit('model_dirs', library_roots(kept + [folder]))
 
     def remove_folder(self, index):
         removed = self.form['model_dirs'][index]
@@ -188,15 +213,27 @@ class Session:
 
 
     def import_packages(self, paths):
-        if self.controller.busy or self.importer.busy:
+        if self.controller.busy or self.importer.busy or self.cleaner.busy:
             return
         if not paths:
             return
         destination = (Path(self.form['destination']).expanduser().resolve() if self.form['new_comfy']
                        else self.engine_root().parent)
         self.importer.start(paths, destination)
+        self.import_retry = ('import', list(paths), destination)
         self.imported_batch = None
         self.error = ''
+
+    def prepare_offline(self):
+        """Models from imported packages, or downloaded into the imported environment.
+
+        Imported model packages are always used; the download is for an
+        environment imported without any.
+        """
+        if self.form['model_method'] == 'auto' and not self.form['offline_models']:
+            self.importer.download(self.form['offline_runtime'], self.source, self.form['sampling_caches'])
+        else:
+            self.importer.prepare(self.form['offline_runtime'], self.form['offline_models'], self.source)
 
     def activate_offline(self, root):
         from .offline_packages import check_runtime_platform
@@ -212,6 +249,13 @@ class Session:
         self.persist()
 
     def action(self, name, accepted=False):
+        if self.cleaner.busy:
+            return
+        # The model download holds the setup lease; launching and opening
+        # FreeVideo continue, anything that would start setup waits for it.
+        if (self.upgrade.active or self.model_switch) and (name in ('retry', 'setup') or
+                                                          (name == 'primary' and self.page != 'launcher')):
+            return
         if self.importer.busy:
             if name == 'stop':
                 self.importer.cancelled.set()
@@ -221,6 +265,25 @@ class Session:
                 self.controller.cancel()
             return
         self.error = ''
+        if name == 'retry':
+            kind = self.retry_kind()
+            if kind == 'import':
+                _, paths, destination = self.import_retry
+                self.importer.start(paths, destination)
+                self.imported_batch = None
+            elif kind == 'prepare':
+                self.prepare_offline()
+                self.imported_batch = None
+            elif kind == 'launch':
+                self.action('launch', accepted)
+            elif kind in ('check', 'install'):
+                # Recompute the plan and live disk space; never install a stale
+                # failed review or discard completed/resumable downloads.
+                self.persist()
+                self.controller.run('inspect', dict(self.form, token=self.token))
+                self.page = 'progress'
+                self.started = time.monotonic()
+            return
         if name == 'setup':
             if getattr(self.controller, 'fixed_environment', False) is True:
                 self.controller.close()
@@ -249,7 +312,8 @@ class Session:
         state = self.controller.state.get('status')
         if (self.page == 'models' and self.form['new_comfy']
                 and self.form['environment_method'] == 'manual' and self.form['offline_runtime']):
-            self.importer.prepare(self.form['offline_runtime'], self.form['offline_models'], self.source)
+            self.import_retry = ('prepare',)
+            self.prepare_offline()
             return
         if self.page == 'comfy':
             if self.form['new_comfy'] and self.form['environment_method'] == 'manual' and not self.form['offline_runtime']:
@@ -282,6 +346,141 @@ class Session:
             self.model_groups = []
         self.started = time.monotonic()
 
+    def retry_kind(self):
+        if self.importer.state.get('status') == 'error' and self.import_retry:
+            return self.import_retry[0]
+        row = self.controller.state
+        if self.page == 'progress' and row.get('status') == 'review' and row.get('errors'):
+            return 'check'
+        if row.get('status') in ('failed', 'cancelled'):
+            if self.page == 'launcher':
+                return 'launch'
+            if self.page == 'progress':
+                return 'install'
+        return ''
+
+    def cleanup_downloads(self, remove=False):
+        if (self.controller.busy or self.importer.busy or self.closing or self.upgrade.active or self.model_switch
+                or self.update_intent or self.engine_updating or self.updater and self.updater.busy):
+            return
+        self.cleaner.start(self.engine_root(), remove=remove)
+
+    def upgrade_model(self):
+        """The user's one consent: download int8 beside the current model, switch, then release the old one.
+
+        After a failure only the step that failed runs again: a stopped download,
+        or a switch that failed before setup started, is offered afresh (files
+        already fetched count); a failed release retries the release. A switch
+        that failed during setup is retried from the setup page, which restores
+        the previous model. An old model left after the switch is released here
+        too, when the user asks.
+        """
+        state = self.upgrade.state
+        if (state.get('status') not in ('available', 'failed', 'releasable') or self.upgrade.busy or self.model_switch
+                or self.closing or self.controller.busy or self.importer.busy or self.cleaner.busy or self.engine_updating):
+            return
+        root = self.engine_root()
+        # Started from Settings after "Later": show the card again.
+        self.upgrade.state = state = dict(state, dismissed=False)
+        if state.get('status') == 'releasable' or state.get('status') == 'failed' and state.get('step') == 'release':
+            # After the switch the int8 model must be in use; files offered on
+            # their own name the variant they keep.
+            self.upgrade.release(root, state.get('in_use') or TARGET)
+            return
+        if state.get('status') == 'failed':
+            # A switch that failed after setup started leaves the installation
+            # unfinished; Retry on the setup page restores it first.
+            if state.get('step') not in ('download', 'switch') or state.get('step') == 'switch' and not state.get('kept'):
+                return
+            from .model_upgrade import offer
+            state = offer(root)
+            self.upgrade.state = state
+            if state.get('status') != 'available':
+                return
+        from .desktop_runtime import materialize_source
+        self.upgrade.source = materialize_source(self.source, root / 'launcher' / 'source')
+        self.upgrade.download(root, state)
+
+    def cancel_model_upgrade(self):
+        self.upgrade.cancel()
+
+    def dismiss_model_upgrade(self):
+        # Hides the card for this session; Settings → Storage keeps the entry.
+        if not self.upgrade.busy and not self.model_switch:
+            self.upgrade.state = dict(self.upgrade.state, dismissed=True)
+
+    def _tick_model_upgrade(self, row, busy):
+        upgrade = self.upgrade
+        state = upgrade.state
+        if self.closing or upgrade.busy:
+            return
+        if (state.get('status') == 'idle' and self.page == 'launcher' and not busy
+                and row.get('status') in ('open', 'ready')):
+            try:
+                upgrade.inspect(self.engine_root())
+            except ValueError:
+                pass
+            return
+        if (state.get('status') == 'unavailable' and state.get('reason') == 'int8-kernels'
+                and self.page == 'launcher' and not busy):
+            # A failed int8 probe is final until the GPU checks run again (a
+            # setup or repair, for example after a driver update).
+            now = time.monotonic()
+            if now - self.receipt_polled >= RECEIPT_POLL_SECONDS:
+                self.receipt_polled = now
+                from .model_upgrade import kernel_receipt
+                try:
+                    changed = kernel_receipt(self.engine_root()) != state.get('receipt')
+                except ValueError:
+                    changed = False
+                if changed:
+                    upgrade.inspect(self.engine_root())
+            return
+        if state.get('status') == 'downloaded' and self.model_switch is None:
+            # Switch only between videos, as an engine update does.
+            if busy or self.engine_updating or self._queue_busy() is not False:
+                return
+            # The switch restarts our ComfyUI so its resident worker lets go of
+            # the old model and the GPU packages setup reinstalls. A ComfyUI
+            # this launcher did not start cannot be restarted: wait until the
+            # user closes it.
+            foreign = self._foreign_server()
+            if foreign is not False:
+                if foreign:
+                    upgrade.waiting_for('comfy')
+                return
+            self.model_switch = 'inspect'
+            upgrade.switching()
+            self.controller.run('inspect', dict(self.form, token=self.token, repair=True, prepared_format='int8'))
+            self.page = 'progress'
+            self.model_groups = []
+            self.started = time.monotonic()
+            return
+        if self.model_switch == 'inspect' and not busy and row.get('action') == 'inspect' and row.get('status') != 'running':
+            plan = row.get('plan') or {}
+            if (row.get('status') == 'review' and not row.get('errors') and plan.get('prepared_format') == 'int8_convrot'
+                    and plan.get('model_download_bytes', 1 << 62) <= 64 * (1 << 20)):
+                # Everything was downloaded and verified beside the old model;
+                # the user agreed to this switch when starting the upgrade.
+                self.model_switch = 'install'
+                self.controller.run('install', True)
+            else:
+                # Only a plan was made; machine.json is unchanged.
+                self.model_switch = None
+                upgrade.switch_failed('\n'.join(row.get('errors') or []) or row.get('error') or
+                                      self.t('The switch needs more files than were downloaded; check again.',
+                                             '切换还需要未下载的文件，请重新检查。'), kept=True)
+            return
+        if self.model_switch == 'install' and not busy and row.get('action') == 'install' and row.get('status') != 'running':
+            self.model_switch = None
+            if row.get('status') in ('open', 'restart-required') or row.get('deployed'):
+                upgrade.release(self.engine_root())
+            else:
+                # Setup marks the installation unfinished when it starts; then
+                # Retry on the setup page restores the previous model.
+                upgrade.switch_failed(row.get('error') or self.t('The switch stopped.', '切换未完成。'),
+                                      kept=self._installation_ready())
+
     def _browser_url(self, address):
         """Return the URL used by the browser, with the launcher locale hint."""
         if not address or not self.language.startswith('zh'):
@@ -307,6 +506,7 @@ class Session:
             if not open_browser(address):
                 raise OSError('The system did not accept the browser request')
             self.browser_error = ''
+            self.browser_opened = time.monotonic()
         except Exception as error:
             self.browser_error = self.t('ComfyUI is ready. Open the browser again or copy its address.\n',
                                         'ComfyUI 已就绪，请重试打开浏览器，或复制地址手动打开。\n') + str(error)
@@ -421,7 +621,7 @@ class Session:
         """One explicit update: the newest launcher if one is known, otherwise
         the engine bundled with this launcher. Downloading, waiting for running
         ComfyUI jobs and restarting continue from tick()."""
-        if self.controller.busy or self.importer.busy or self.closing:
+        if self.controller.busy or self.importer.busy or self.cleaner.busy or self.closing:
             if source == 'browser':
                 self.bridge_pending = True
             return
@@ -470,6 +670,30 @@ class Session:
             self.queue_thread.start()
         return self.queue_state
 
+    def _foreign_server(self):
+        """Whether a ComfyUI this launcher did not start answers at the address; None before known."""
+        owns = getattr(self.controller, 'owns_server', None)
+        if callable(owns) and owns() is True:
+            return False
+        now = time.monotonic()
+        if (self.foreign_thread is None or not self.foreign_thread.is_alive()) and (
+                self.foreign_state is None or now - self.foreign_polled >= QUEUE_POLL_SECONDS):
+            from .comfy_launcher_runtime import server_info
+            url = (self.controller.selection or self.selected or {}).get('url') or self.form['url']
+            self.foreign_polled = now
+            def poll():
+                # Off the UI thread, like the queue poll.
+                self.foreign_state = server_info(url).get('status') != 'offline'
+            self.foreign_thread = threading.Thread(target=poll, name='freevideo-server', daemon=True)
+            self.foreign_thread.start()
+        return self.foreign_state
+
+    def _installation_ready(self):
+        try:
+            return json.loads((self.engine_root() / 'machine.json').read_text(encoding='utf-8')).get('ready') is True
+        except (OSError, ValueError, AttributeError):
+            return False
+
     def _restart_when_idle(self):
         row = self.updater.state
         if row.get('status') != 'ready' or self.update_restarting:
@@ -496,7 +720,7 @@ class Session:
         self.closing = True
 
     def _update_engine_when_idle(self):
-        if self.controller.busy or self.importer.busy:
+        if self.controller.busy or self.importer.busy or self.upgrade.active or self.model_switch:
             return
         busy = self._queue_busy()
         self.update_waiting = bool(busy)
@@ -590,6 +814,15 @@ class Session:
             return 'review'
         return ''
 
+    def model_phase(self):
+        """For open pages: switching to the int8 model restarts our ComfyUI once."""
+        if self.model_switch:
+            return 'switching'
+        state = self.upgrade.state
+        if state.get('status') == 'downloaded' and not state.get('waiting'):
+            return 'waiting'
+        return ''
+
     def source_stamp(self, source):
         """(version, built_at) of an engine source; a source checkout has neither."""
         if not source:
@@ -612,6 +845,15 @@ class Session:
     def installed_version(self):
         return self.source_stamp((self.selected or {}).get('source'))[0]
 
+    def installed_product_version(self):
+        """The product version of the engine the selected installation runs, if it says."""
+        source = (self.selected or {}).get('source')
+        try:
+            value = json.loads((Path(source) / 'freevideo_engine/release_notes.json').read_text(encoding='utf-8'))
+        except (OSError, ValueError, TypeError):
+            return None
+        return value.get('product_version') if isinstance(value, dict) else None
+
     def update_view(self):
         from .release_notes import installed_details, public_details
         if self.release_details is None:
@@ -626,6 +868,11 @@ class Session:
                     channel=self.updater.current.get('channel') if self.updater else None,
                     track=self.updater.current.get('track', 'stable') if self.updater else 'stable',
                     manual=bool(self.updater and self.updater.current.get('packaging') in ('onedir', 'app')))
+        # Versions between the one in use and the update, so skipped notes are not lost.
+        from .release_notes import since
+        current = view['current_release'] or {}
+        view['candidate_earlier'] = since(view.get('candidate'), current.get('product_version')) if view.get('candidate') else []
+        view['engine_earlier'] = since(current, self.installed_product_version()) if view['engine'] else []
         due = ((view.get('candidate') and row['status'] in ('available', 'ready', 'error'))
                or (view['engine'] and self.page == 'launcher'))
         view['remind'] = bool(key and due and self.update_snoozed.get(key, 0) <= time.monotonic()
@@ -638,7 +885,7 @@ class Session:
         view = self.update_view()
         from .release_notes import public_details
         candidate = view.get('candidate') or {}
-        value = dict(version=__version__, phase=view['phase'], status=view.get('status'),
+        value = dict(version=__version__, phase=view['phase'], model=self.model_phase(), status=view.get('status'),
                      progress=view.get('progress'), manual=view['manual'], channel=view['channel'], track=view['track'],
                      candidate=public_details(candidate) if candidate.get('version') else None,
                      engine=dict(view['current_release'], pending=view['engine'], installed=view['installed']),
@@ -664,6 +911,7 @@ class Session:
             self.closing = True
             if self.updater:
                 self.updater.cancelled.set()
+            self.upgrade.close()
             self.controller.close()
             from .launcher_bridge import remove
             remove(self.bridge)
@@ -673,6 +921,7 @@ class Session:
         imported = self.importer.state
         if not self.importer.busy and imported is not self.imported_batch:
             self.imported_batch = imported
+            retry = self.import_retry
             for package in imported.get('packages', []):
                 if package['kind'] == 'runtime':
                     self.edit('offline_runtime', package['root'])
@@ -685,13 +934,26 @@ class Session:
             if imported.get('packages'):
                 self.edit('model_method', 'manual')
                 self.persist()
+            if imported.get('runtime_skipped') and not any(p['kind'] == 'runtime' for p in imported.get('packages', [])):
+                # The runtime installs automatically; imported model packages still feed it.
+                self.edit('offline_runtime', '')
+                self.edit('environment_method', 'auto')
             if imported['status'] == 'error':
+                self.import_retry = retry
                 self.error = imported['error']
             elif imported['status'] == 'prepared':
                 self.activate_offline(imported['ready_root'])
 
         row = self.controller.state
         busy = self.controller.busy
+        selection = getattr(self.controller, 'selection', None)
+        if (row.get('status') == 'open' and not busy and not self.smoke and selection
+                and selection.get('source') != self.old_versions_retired):
+            # ComfyUI runs this version now: earlier FreeVideo copies are no longer read.
+            self.old_versions_retired = selection.get('source')
+            retire = getattr(self.controller, 'retire_old_versions', None)
+            if retire:
+                retire(dict(selection))
         if self.engine_autoinstall and not busy and row.get('action') == 'inspect' and row.get('status') != 'running':
             self.engine_autoinstall = False
             selection = row.get('selection') or {}
@@ -737,12 +999,33 @@ class Session:
             elif not self.reload_expected or time.monotonic() >= self.browser_wait:
                 self.reload_expected = False
                 self.open_browser()
+        self._tick_page_check(row)
+        self._tick_model_upgrade(row, busy)
         sources = self.controller.terminal_sources()
         if sources:
             selected = next((p for _, p in sources if p == self.log_source), sources[-1][1])
             self.tail.select(selected)
             self.tail.read(final=not self.controller.terminal_running(selected))
         self._tick_updates()
+
+    def _tick_page_check(self, row):
+        """Show a page that failed to load FreeVideo, or never reported, in the failure card."""
+        if row.get('status') != 'open' or self.closing or self.smoke:
+            self.page_check.reset()
+            self.browser_opened, self.page_error = None, ''
+            return
+        address = row['url'].split('/?')[0]
+        self.page_check.poll(address)
+        self.page_error = self.page_check.text(self.t, self.browser_opened, address)
+
+    def old_versions_text(self):
+        """What the background removal of earlier FreeVideo copies freed this session."""
+        value = getattr(self.controller, 'old_versions', None)
+        released = value.get('released_bytes') if isinstance(value, dict) else None
+        if not isinstance(released, int) or released < 2**20:
+            return ''
+        size = '%.1f GiB' % (released / 2**30) if released >= 2**30 else '%d MiB' % (released // 2**20)
+        return self.t('Old versions removed · %s freed', '已清理旧版本 · 释放 %s') % size
 
     def snapshot(self):
         from .failure_details import launcher_failure, redacted_launcher_error
@@ -752,7 +1035,21 @@ class Session:
         task = row.get('task', {})
         progress = progress_view(task.get('progress') or {}, zh)
         overall = progress_view(row.get('overall') or task.get('phase_progress') or {}, zh)
-        errors = [self.error, self.browser_error, row.get('error', ''), *row.get('errors', [])]
+        if self.importer.busy:
+            # The sidebar's Working card follows the offline import, not the idle installer.
+            state = self.importer.state
+            if state.get('status') == 'downloading':
+                label = self.t('Downloading models', '下载模型')
+            elif state.get('status') == 'preparing':
+                label = self.t('Checking packages', '检查配套包')
+            else:
+                label = self.t('Importing offline packages', '导入离线包')
+                if (state.get('count') or 0) > 1:
+                    label += ' %d/%d' % (state.get('index') or 1, state['count'])
+                if state.get('detail'):
+                    label += ' · ' + display(state['detail'], zh)
+            overall = dict(label=label, done=state.get('done'), total=state.get('total'))
+        errors = [self.error, self.browser_error, self.page_error, row.get('error', ''), *row.get('errors', [])]
         shortcut = row.get('shortcut') or {}
         if shortcut.get('status') == 'failed':
             errors.append(shortcut.get('error', ''))
@@ -810,12 +1107,18 @@ class Session:
                     ok=entry.get('ok', False), rate=speed_text(entry, self.language.startswith('zh'))))
         from .sampling_assets import total_bytes
         return dict(sampling_cache_bytes=total_bytes(), version=__version__, zh=self.language.startswith('zh'), form=dict(self.form),
-            page=self.page, status=row.get('status', 'idle'), busy=self.controller.busy or self.importer.busy,
+            page=self.page, status=row.get('status', 'idle'), busy=self.controller.busy or self.importer.busy or self.cleaner.busy,
+            cleanup=dict(self.cleaner.state, busy=self.cleaner.busy),
+            can_cleanup=not (self.controller.busy or self.importer.busy or self.cleaner.busy or self.closing
+                or self.update_intent or self.engine_updating or self.updater and self.updater.busy
+                or self.upgrade.active or self.model_switch),
+            model_upgrade=dict(self.upgrade.state, busy=self.upgrade.busy, switching=bool(self.model_switch)),
             offline=dict(progress_view(self.importer.state, zh), runtime=bool(self.form['offline_runtime']),
                 runtime_supported=runtime_packages_supported(),
-                models=len(self.form['offline_models']), guide=package_instructions(self.form['new_comfy'], zh)),
+                models=len(self.form['offline_models']), guide=package_instructions(self.form['new_comfy'] and self.form['environment_method'] == 'manual'
+                                           and not self.form['offline_runtime'], zh)),
             video_model_guide=video_instructions(zh),
-            selected=bool(self.selected), error=error, notice=self.notice, compatibility=self.compatibility,
+            selected=bool(self.selected), error=error, retry_kind=self.retry_kind(), notice=self.notice, compatibility=self.compatibility,
             report=dict(self.report),
             models=models, overall=overall, progress=progress, detail=clean(progress.get('detail', '')),
             progress_text=progress_text(progress, self.language.startswith('zh')),
@@ -825,6 +1128,7 @@ class Session:
             probe=probe, speeds=speeds, token_set=bool(self.token),
             log=self.tail.text, logs=[dict(label=display(n, zh), path=str(p)) for n, p in self.controller.terminal_sources()],
             url=(self._browser_url(row.get('url', '')) if row.get('status') == 'open' else ''), shortcut=shortcut,
+            old_versions=self.old_versions_text(),
             can_shortcut=bool(self.controller.selection and self.controller.selection.get('ready')),
             update=update, engine_update_available=bool(row.get('engine_update_available')),
             settings_path=str(self.store.primary),

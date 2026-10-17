@@ -228,9 +228,34 @@ def node_target(root):
     return target
 
 
+GIT_IGNORE = ('# FreeVideo engine: environments, models and caches, not part of any git checkout.\n'
+              '# Keeps an update of a surrounding ComfyUI from copying, moving or deleting them.\n*\n')
+
+
+def shield_engine(engine):
+    """Keep a surrounding git checkout's operations away from the engine.
+
+    Inside an existing ComfyUI the engine is an untracked folder of tens of
+    gigabytes. An updater that stashes or cleans untracked files (git stash -u,
+    git add -A, git clean) would copy it into git or move it away. Only the
+    launcher's engine folders get the marker, never a source checkout.
+    """
+    engine = Path(engine)
+    marker = engine / '.gitignore'
+    if (not engine.is_dir() or os.path.lexists(marker) or (engine / '.git').exists()
+            or (engine / 'freevideo_engine').is_dir()):
+        return False
+    try:
+        marker.write_text(GIT_IGNORE, encoding='utf-8')
+    except OSError:
+        return False
+    return True
+
+
 def deploy(root, source, engine):
     """Update only our entry point; preserve source edits, libraries and templates."""
     root, source, engine = map(lambda p: Path(p).resolve(), (root, source, engine))
+    shield_engine(engine)
     target = node_target(root)
     target.mkdir(parents=True, exist_ok=True)
     receipt = target / 'freevideo-launcher.json'
@@ -297,6 +322,52 @@ class Controller:
         # Set by the Qt session: lets the server it starts hand browser update
         # requests back to this launcher.
         self.update_bridge = None
+        # Earlier FreeVideo copies removed in the background once ComfyUI runs
+        # this version; kept out of `state`, which the task thread replaces.
+        self.old_versions = dict(released_bytes=0)
+        self._old_versions_thread = None
+
+    def retire_old_versions(self, selected):
+        """Once ComfyUI runs this version, earlier FreeVideo copies are no longer read."""
+        if self._old_versions_thread is not None and self._old_versions_thread.is_alive():
+            return
+        def work():
+            from .desktop_runtime import launcher_root
+            from .launcher_update import current_build
+            from .version_cleanup import run
+            try:
+                result = run(launcher_root=launcher_root(), launcher_source=self.source, launcher_build=current_build(),
+                             running=[sys.executable] if getattr(sys, 'frozen', False) else [],
+                             engine=selected['engine'], comfy_root=selected['root'],
+                             engine_source=selected['source'], server_source=server_info(selected['url']).get('source'))
+            except Exception as error:  # Cleanup never affects using ComfyUI.
+                result = dict(released_bytes=0, error=type(error).__name__ + ': ' + str(error))
+            self.old_versions = dict(result, released_bytes=self.old_versions['released_bytes'] + result['released_bytes'])
+        self._old_versions_thread = threading.Thread(target=work, name='freevideo-old-versions', daemon=True)
+        self._old_versions_thread.start()
+
+    def _prepare_frontend(self, selected, *, download=False):
+        """Bring the separate ComfyUI environment up to date with this ComfyUI.
+
+        After ComfyUI itself is updated, its requirements change; the same
+        environment is updated in place and keeps its PyTorch. Our own idle
+        server is stopped first: Windows cannot replace packages it has loaded.
+        """
+        if self.setup is None:
+            folders = SimpleNamespace(base_path=selected['root'], models_dir=str(Path(selected['root']) / 'models'),
+                                      get_folder_paths=lambda _: [])
+            self.setup = Setup(Path(selected['source']), folders, LauncherRunner)
+        if managed_python(Path(selected['engine']), Path(selected['root'])) is None:
+            self._stop_server_for_setup(selected['url'])
+        self.setup.state = dict(status='running', action='comfy-host')
+        self.setup.events.reset()
+        arguments = ['comfy-host', '--comfy', selected['root']]
+        if download:
+            arguments.append('--download-comfy')
+        self.setup.runner.start('comfy-host', selected['engine'], arguments)
+        self._wait_setup()
+        descriptor = json.loads((Path(selected['engine']) / 'launcher' / 'comfy-host.json').read_text(encoding='utf-8'))
+        selected['python'] = descriptor['python']
 
     def owns_server(self):
         return self.server is not None and self.server.poll() is None
@@ -507,8 +578,11 @@ class Controller:
             if not isinstance(extra, list) or any(not isinstance(p, str) for p in extra):
                 raise ValueError('Model folders must be a list of directory paths')
             extra = extra + ([values['models']] if values.get('models') else [])
+            # A saved folder that no longer exists (for example a removed offline
+            # package) has nothing to reuse; it must not stop the installation.
+            extra = [p for p in dict.fromkeys(extra) if p.strip() and Path(p).expanduser().is_dir()]
             self.setup.inspect(dict(root=str(engine), extra_libraries=extra, copy=False,
-                sampling_caches=bool(values.get('sampling_caches')),
+                sampling_caches=bool(values.get('sampling_caches')), prepared_format=values.get('prepared_format'),
                 frontend=dict(root=descriptor['root'], separate=descriptor['separate'], download=fresh)))
             row = self._wait_setup()
             self.state = dict(self.state, plan=row['plan'])
@@ -530,22 +604,15 @@ class Controller:
             validate_target(selected['root'])
         if not selected['ready']:
             self.stage('engine', label='Prepare FreeVideo')
+            self._stop_server_for_setup(selected['url'])
             current = self.setup.status()
             self.setup.install(dict(plan_id=current.get('plan_id'), accept_licenses=True))
             self._wait_setup()
         if selected['separate']:
             if self.cancelled.is_set():
                 raise RuntimeError('Stopped; files retained')
-            self.setup.state = dict(status='running', action='comfy-host')
-            self.setup.events.reset()
             self.stage('comfy', label='Prepare ComfyUI')
-            arguments = ['comfy-host', '--comfy', selected['root']]
-            if selected.get('new_comfy'):
-                arguments.append('--download-comfy')
-            self.setup.runner.start('comfy-host', selected['engine'], arguments)
-            self._wait_setup()
-            descriptor = json.loads((Path(selected['engine']) / 'launcher' / 'comfy-host.json').read_text(encoding='utf-8'))
-            selected['python'] = descriptor['python']
+            self._prepare_frontend(selected, download=bool(selected.get('new_comfy')))
         if self.cancelled.is_set():
             raise RuntimeError('Stopped; files retained')
         self.stage('nodes', label='Install FreeVideo workflow')
@@ -554,6 +621,18 @@ class Controller:
         self.selection = selected
         self.state = dict(self.state, selection=dict(selected), deployed=deployed)
         self._connect()
+
+    def _stop_server_for_setup(self, url):
+        """Setup reinstalls engine packages that our ComfyUI's resident worker
+        keeps loaded after a video (Windows refuses to replace SageAttention's
+        _fused.pyd), and a model switch must not leave the old model in that
+        worker. Stop our own idle server; connecting after setup starts it
+        again. A running job is never stopped."""
+        if not self.owns_server():
+            return
+        if queue_busy(url):
+            raise RuntimeError('ComfyUI is running a job. Try again after it finishes; the job is left running.')
+        self.stop_owned_server()
 
     def ensure_shortcut(self):
         from .desktop_shortcut import create_after_install
@@ -575,8 +654,22 @@ class Controller:
         # Covers old installations, deleted links and directly connecting to an
         # existing server, as well as the first installation.
         self.ensure_shortcut()
-        self.stage('open', label='Open ComfyUI')
+        shield_engine(selected['engine'])
         url = selected['url']
+        frontend_error = None
+        if (selected.get('python') and managed_frontend(selected)
+                and managed_python(Path(selected['engine']), Path(selected['root'])) is None):
+            # ComfyUI was updated since its separate environment was prepared.
+            self.sections = [('comfy', 5), ('open', 1)]
+            self.stage('comfy', label='Update ComfyUI packages')
+            try:
+                self._prepare_frontend(selected)
+            except Exception as error:
+                if self.cancelled.is_set():
+                    raise
+                # Offline, say: the previous environment may still run this ComfyUI.
+                frontend_error = str(error)
+        self.stage('open', label='Open ComfyUI')
         info = server_info(url)
         if matches_server(info, selected['root'], selected['engine'], selected['source']):
             self.attach_console(info)
@@ -664,8 +757,11 @@ class Controller:
                 raise RuntimeError('ComfyUI startup cancelled')
             if server.poll() is not None:
                 from .failure_details import startup_failure
-                raise RuntimeError(startup_failure('ComfyUI could not start.', directory / 'comfy.log',
-                                                  exit_code=server.returncode, context=context))
+                message = startup_failure('ComfyUI could not start.', directory / 'comfy.log',
+                                          exit_code=server.returncode, context=context)
+                if frontend_error:
+                    message += '\n\nComfyUI packages could not be updated first: ' + frontend_error
+                raise RuntimeError(message)
             info = server_info(url)
             if matches_server(info, selected['root'], selected['engine'], selected['source']):
                 self.stage('open', done=1, label='Ready')

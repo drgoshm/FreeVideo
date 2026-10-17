@@ -2,7 +2,7 @@ import { createErrorPanel, errorText } from './error_panel.js';
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { openStudio, loraPanel, loraWarning, promptGuide } from "./studio.js";
-import { createGenerationProgress, referenceTrimText } from './generation_progress.js';
+import { createGenerationProgress, referenceTrimText, thermalText } from './generation_progress.js';
 import { createProgressConnection } from './progress_connection.js';
 import { notifyCompatibility } from './compatibility.js';
 import { startUpdateChecks } from './updates.js';
@@ -10,7 +10,9 @@ import { installNavigation, refreshNavigation, preferredView } from './view_navi
 import { attachReferencePicker, referenceItems, syncReferencePrompt } from './prompt_references.js';
 import { outputDownloadURL } from './output_download.js';
 import { shareButton } from './share.js';
-import { regenerateResult } from './studio_queue.js';
+import { reportFileName } from './report_issue.js';
+import { rememberPromptDraft, savePromptDraft } from './prompt_draft.js';
+import { regenerateResult, upscaleResult } from './studio_queue.js';
 
 const languageOverride = typeof location !== 'undefined'
     ? new URLSearchParams(location.search).get('freevideo_lang') : null;
@@ -280,9 +282,13 @@ function resultPanel(node) {
         if (!note) { note = el('div', '', 'fv-note fv-prewarm'); panel.append(note); }
         const onGPU = Number.isFinite(value.gpu_bytes_after);
         const size = onGPU ? ` · ${(value.gpu_bytes_after / 2 ** 30).toFixed(1)} GiB` : '';
-        note.textContent = value.state === 'loading' ? text('Preparing text encoder on GPU in background', '正在后台预加载文本编码器到 GPU') + size
+        const percent = ` · ${Math.min(100, Math.floor(100 * value.done_bytes / value.bytes))}%`;
+        note.textContent = value.purpose === 'upscale'
+            ? (value.state === 'reading' ? text('Preparing the files the second pass reads', '正在预读二采要用的模型文件') + percent
+                : value.state === 'ready' ? text('Second-pass files warmed · no VRAM reserved', '二采要用的模型文件已预热 · 不占用显存') : '')
+            : value.state === 'loading' ? text('Preparing text encoder on GPU in background', '正在后台预加载文本编码器到 GPU') + size
             : value.state === 'partial' ? text('Text encoder partially prepared on GPU', '文本编码器已部分预加载到 GPU') + size
-            : value.state === 'reading' ? text('Preparing encoder files', '正在预读编码器文件') + ` · ${Math.min(100, Math.floor(100 * value.done_bytes / value.bytes))}%`
+            : value.state === 'reading' ? text('Preparing encoder files', '正在预读编码器文件') + percent
             : value.state === 'ready' ? (onGPU ? text('Text encoder ready on GPU', '文本编码器已在 GPU 就绪') + size
                 : text('Encoder files warmed · no VRAM reserved', '编码器文件已预热 · 不占用显存')) : '';
         node.freevideoPrewarm = note.textContent;
@@ -305,10 +311,23 @@ function resultPanel(node) {
         const links = el("div", undefined, "fv-links");
         for (const [label, file] of [[text("Download video", "下载视频"), value.video], [text("Report", "报告"), value.report]]) {
             if (!file) continue;
-            const link = el("a", label); link.href = outputDownloadURL(api, file); link.download = file === value.video ? '' : file.split("/").pop(); links.append(link);
+            const link = el("a", label); link.href = outputDownloadURL(api, file); link.download = file === value.video ? '' : reportFileName();
+            // Named when clicked, like the creation panel's report: saving it again is not "video.debug (1).json".
+            if (file !== value.video) link.onclick = () => { link.download = reportFileName(); };
+            links.append(link);
         }
         links.append(shareButton(value, text));
         links.append(el("span", value.result_cache_hit ? text("Reused previous result", "已复用上次结果") : value.conditioning_cache_hit ? text("Input cache reused", "已复用输入缓存") : text("Inputs encoded", "已编码输入"), "fv-mode"));
+        if (value.preview) {
+            const upscale = el('button', text('Run second pass', '继续二采')); upscale.type = 'button';
+            upscale.title = text('Continue from this preview: latent upscale, the second pass and a full-resolution decode.', '从这个预览接着跑：潜空间放大、二采，再以全分辨率解码。');
+            upscale.onclick = async () => {
+                upscale.disabled = true;
+                try { await node.freevideoUpscaleResult(value); upscale.textContent = text('Queued', '已加入队列'); }
+                catch (error) { upscale.disabled = false; node.freevideoShowFailure({exception_message: error.message}); }
+            };
+            links.append(upscale);
+        }
         if (value.result_cache_hit) {
             const again = el('button', text('Regenerate', '重新生成')); again.type = 'button';
             again.onclick = async () => {
@@ -320,10 +339,18 @@ function resultPanel(node) {
         }
         panel.append(stats, links, progress.report);
         for (const row of value.reference_trims || []) panel.append(el("div", referenceTrimText(row, text), "fv-note fv-trim-note"));
+        if (value.low_memory && !value.result_cache_hit) panel.append(el("div", text('This video used the low-memory mode for this GPU, so it took longer than usual. A lower resolution or a shorter video runs faster.', '这段视频使用了省显存方式，所以比平时慢。降低分辨率或缩短时长会更快。'), "fv-note"));
+        if (value.thermal && !value.result_cache_hit) panel.append(el("div", thermalText(value.thermal, text), "fv-note"));
         warn();
         panel.title = (unified
             ? text("Unified memory: device capacity. Process RAM is not total GPU memory, ", "统一内存为设备总量；进程内存不代表 GPU 内存总占用，")
             : text("VRAM: engine allocator peak. RAM: measured request processes, ", "显存为引擎分配器峰值，内存为请求进程实测，")) + (value.ram_metric || "unknown");
+    };
+    node.freevideoUpscaleResult = async value => {
+        if (node.freevideoUpscaling) return;
+        node.freevideoUpscaling = true;
+        try { return await upscaleResult(api, node.id, value, () => app.graphToPrompt()); }
+        finally { node.freevideoUpscaling = false; }
     };
     node.freevideoRegenerateResult = async value => {
         if (node.freevideoRegenerating) return;
@@ -346,6 +373,12 @@ function syncPrompts(reset = false) {
 }
 window.addEventListener('freevideo-media', () => syncPrompts());
 
+// health.js names what failed; files loaded before it queue their reports.
+const health = item => (window.__freevideoHealth ||= []).push(item);
+function showStudio(node) {
+    try { openStudio(node); } catch (error) { console.error('FreeVideo workspace:', error); health({type: 'error', where: 'studio', error}); }
+}
+
 const progressConnection = createProgressConnection(api, message => {
     const node = app.graph?.getNodeById(message.node);
     if (!node?.freevideoShowProgress) return false;
@@ -359,7 +392,16 @@ const progressConnection = createProgressConnection(api, message => {
 app.registerExtension({
     name: "FreeVideo.UnifiedMedia",
     beforeConfigureGraph() { configuringGraph = true; },
-    async setup() { progressConnection.start(); installNavigation(openStudio); startUpdateChecks(); await notifyCompatibility(); },
+    async setup() {
+        // One failing part must not take the others down; health.js shows what failed.
+        for (const [where, start] of [['progress', () => progressConnection.start()], ['navigation', () => installNavigation(showStudio)],
+            ['updates', startUpdateChecks]]) {
+            try { start(); } catch (error) { health({type: 'error', where, error}); }
+        }
+        window.addEventListener('pagehide', () => savePromptDraft(api, true));
+        window.FreeVideoUI = {...window.FreeVideoUI, ready: true};
+        await notifyCompatibility();
+    },
     async beforeRegisterNodeDef(nodeType, nodeData) {
         if (nodeData.name === 'FreeVideoReference') {
             const connected = nodeType.prototype.onConnectionsChange;
@@ -367,6 +409,7 @@ app.registerExtension({
             return;
         }
         if (!["FreeVideoMedia", "FreeVideoGenerate", "FreeVideoLoRAStack"].includes(nodeData.name)) return;
+        if (nodeData.name === "FreeVideoGenerate") nodeType.prototype.freevideoStarterPrompt = nodeData.input?.required?.text?.[1]?.default || '';
         const created = nodeType.prototype.onNodeCreated;
         nodeType.prototype.onNodeCreated = function () {
             const result = created?.apply(this, arguments);
@@ -401,8 +444,15 @@ app.registerExtension({
                             '修改采样步数可能降低生成质量。默认一采 8 步、二采 3 步；其他二采步数需小于一采步数。');
                     }
                 }
+                const prompt = this.widgets?.find(w => w.name === 'text');
+                if (prompt) {
+                    // Every edit, in the creation panel or on the node, is the draft the launcher reopens.
+                    const node = this, callback = prompt.callback;
+                    prompt.callback = function (...args) { if (!configuringGraph) rememberPromptDraft(api, node); return callback?.apply(this, args); };
+                    prompt.inputEl?.addEventListener?.('input', () => rememberPromptDraft(api, node));
+                }
                 resultPanel(this);
-                this.addWidget('button', text('Open creative workspace', '打开创作面板'), null, () => openStudio(this), {serialize: false});
+                this.addWidget('button', text('Open creative workspace', '打开创作面板'), null, () => showStudio(this), {serialize: false});
                 const removed = this.onRemoved;
                 this.onRemoved = function (...args) { const value = removed?.apply(this, args); requestAnimationFrame(refreshNavigation); return value; };
                 requestAnimationFrame(refreshNavigation);
@@ -418,7 +468,7 @@ app.registerExtension({
         refreshNavigation();
         if (app.graph?.extra?.freevideo_studio && preferredView() !== 'nodes') {
             const node = app.graph._nodes.find(n => n.comfyClass === 'FreeVideoGenerate' || n.type === 'FreeVideoGenerate');
-            if (node) requestAnimationFrame(() => openStudio(node));
+            if (node) requestAnimationFrame(() => showStudio(node));
         }
     },
     onNodeOutputsUpdated(outputs) {

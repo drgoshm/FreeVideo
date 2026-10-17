@@ -26,7 +26,8 @@ from .monitoring import save
 from .install_tuning import build_parallelism, required_models, cache_compatible, wheel_key
 from .terminal_ui import TerminalUI, LogProgress
 from .locking import runtime_lock, LOCK_ENV
-from .environments import ENVIRONMENTS, environment_names, select_layout, role_pythons, constraints_file, bootstrap_versions
+from .environments import (ENVIRONMENTS, environment_names, select_layout, role_pythons, constraints_file,
+                           bootstrap_versions, uv_file_arguments)
 from . import network
 from . import processes
 from .system import install_root, venv_python, system_memory, nvidia_smi, memory_sample, curl_executable, missing_curl_message
@@ -204,7 +205,24 @@ def inventory(gpu=None):
             'kernel': platform.release(), 'platform': platform.platform(), 'machine': platform.machine(),
             'cpu_threads': os.cpu_count(), 'swap_total_bytes': ram.get('swap_total_bytes'),
             'swap_free_bytes': ram.get('swap_free_bytes'), 'system_memory': ram,
-            'compiler': shutil.which('cl' if platform.system() == 'Windows' else 'g++'), 'git': shutil.which('git')}
+            'compiler': shutil.which('cl' if platform.system() == 'Windows' else 'g++'), 'git': usable_git(),
+            'git_found': shutil.which('git')}
+
+
+# Windows reuses a detected Git from 2.35, the oldest tested there, and
+# otherwise installs its own MinGit.
+WINDOWS_MIN_GIT = (2, 35)
+
+
+def git_floor(system=None):
+    return WINDOWS_MIN_GIT if (system or platform.system()) == 'Windows' else network.MIN_GIT
+
+
+def usable_git(path=None, env=None):
+    """The Git on PATH when it is new enough for clone(); None otherwise."""
+    executable = shutil.which('git', path=path)
+    version = network.git_version(executable, env) if executable else None
+    return executable if version and version >= git_floor() else None
 
 
 def existing_parent(path):
@@ -233,6 +251,48 @@ def model_target(row, model_dir, encoder_dir, prepared_dir=None):
     return (model_dir if row['repo'].startswith('OpenVDN/') else encoder_dir) / row['file']
 
 
+def resolve_prepared_format(requested, saved, hardware):
+    """The prepared model format of this setup run: 'int8_convrot' or 'fp8'.
+
+    An explicit choice wins. Otherwise an installation keeps the format it
+    recorded, and one from before the choice existed keeps its FP8 model, so an
+    update never starts a model download by itself. A fresh installation takes
+    the faster format for its GPU.
+    """
+    choices = {'int8': 'int8_convrot', 'int8_convrot': 'int8_convrot', 'fp8': 'fp8'}
+    if requested in choices:
+        return choices[requested]
+    if requested not in (None, 'auto'):
+        raise ValueError('Unknown prepared model format: ' + str(requested))
+    recorded = saved.get('prepared_format')
+    if recorded in ('int8_convrot', 'fp8'):
+        return recorded
+    if saved.get('cache'):
+        return 'fp8'
+    from .prepared_model import preferred_format
+    return preferred_format(hardware) or 'fp8'
+
+
+def require_int8_kernels(plan, kernel_report):
+    """Stop a setup that installs the int8 model unless its GPU kernels passed on this machine.
+
+    machine.json is written only after every step, so the installation keeps
+    the model it had.
+    """
+    if plan.get('prepared_format') != 'int8_convrot' or plan.get('inventory', {}).get('hardware', {}).get('system') == 'Darwin':
+        return
+    from .kernel_capabilities import readiness
+    rows = json.loads(Path(kernel_report).read_text(encoding='utf-8')).get('kernel_probes', [])
+    if not readiness(rows).get('int8_ready'):
+        raise RuntimeError('The int8 model needs int8 GPU kernels, and they did not pass on this GPU. The '
+                           'installation keeps its current model. Details: ' + str(kernel_report))
+
+
+def offline_installation(root):
+    """Whether an engine folder belongs to an installation from offline packages."""
+    return (root.parent / 'portable.json').is_file()
+
+
 def plan(args, *, local_progress=None):
     root = args.root.expanduser().resolve()
     saved = json.loads((root / 'machine.json').read_text(encoding='utf-8')) if (root / 'machine.json').is_file() else {}
@@ -253,6 +313,7 @@ def plan(args, *, local_progress=None):
         snapshot, resources, errors = preflight(args, fixture, ram_gib=ram_gib, vram_gib=vram_gib)
         system, windows_target, layout = 'Darwin', False, 'unified'
         cache_format = dict(capability=None, scale_granularity='int8_convrot')
+        prepared_format = 'int8_convrot'
     else:
         if not args.hardware_json and (platform.system() not in ('Linux', 'Windows') or platform.machine().lower() not in ('x86_64', 'amd64')):
             raise RuntimeError('One-click setup supports Linux x86_64 and native Windows x64.')
@@ -273,9 +334,14 @@ def plan(args, *, local_progress=None):
         if compatibility['error']:
             errors.append(compatibility['error'])
         snapshot['cuda_compatibility'] = compatibility
-        for name in () if windows_target else ('git', 'compiler'):
+        # A missing or too old Git is replaced by FreeVideo's own.
+        for name in () if windows_target else ('compiler',):
             if not snapshot.get(name):
                 errors.append('Missing %s. Run ./setup.sh interactively to install basic tools, then review the engine plan.' % name)
+        if offline_installation(root):
+            # Its sources carry no Git history and its Python is the package's.
+            errors.append('This folder holds an installation from offline packages; automatic installation does not change it. '
+                          'Open it from the launcher, or choose another folder for an automatic installation.')
         curl_env = dict(os.environ, FREEVIDEO_HOME=str(root))
         if not args.hardware_json and curl_executable(curl_env) is None:
             errors.append(missing_curl_message(curl_env))
@@ -287,6 +353,21 @@ def plan(args, *, local_progress=None):
             errors.append(str(error))
         system = hardware.system
         cache_format = dict(capability=hardware.capability)
+        prepared_format = resolve_prepared_format(getattr(args, 'prepared_format', 'auto'), saved, hardware)
+        if (prepared_format == 'int8_convrot' and getattr(args, 'prepared_format', 'auto') in (None, 'auto')
+                and getattr(args, 'reuse_models', None) and not getattr(args, 'cache', None)):
+            # A fresh installation pointed at an existing FP8 model reuses it
+            # instead of downloading the int8 one; switching stays a choice.
+            from . import install_tuning
+            if (install_tuning.discover_prepared(args.reuse_models, hardware.capability, scale_granularity='int8_convrot') is None
+                    and install_tuning.discover_prepared(args.reuse_models, hardware.capability) is not None):
+                prepared_format = 'fp8'
+        if getattr(args, 'cache', None) and getattr(args, 'prepared_format', 'auto') in (None, 'auto'):
+            # An explicitly named cache keeps its own format.
+            prepared_format = ('int8_convrot' if cache_compatible(args.cache, hardware.capability, scale_granularity='int8_convrot')
+                               else 'fp8')
+        if prepared_format == 'int8_convrot':
+            cache_format['scale_granularity'] = 'int8_convrot'
     model_dir = Path(args.models or saved.get('model_root') or root / 'models' / 'vdn').expanduser().resolve()
     encoder_dir = Path(args.encoder_models or saved.get('encoder_model_root') or prior.get('encoder_dir') or root / 'models' / 'encoder').expanduser().resolve()
     reuse_cache = args.cache.expanduser().resolve() if args.cache else None
@@ -436,6 +517,7 @@ def plan(args, *, local_progress=None):
             'model_dir': str(model_dir), 'encoder_dir': str(encoder_dir),
             'reuse_cache': str(reuse_cache) if reuse_cache else None,
             'prepared_model': prepared, 'sampling_caches': sampling_caches,
+            'prepared_format': prepared_format, 'model_scale_granularity': cache_format.get('scale_granularity'),
             'model_source': 'prepared' if prepared else 'existing' if reuse_cache else 'source',
             'model_source_reason': ('Pinned slim model, matching the existing GPU precision policy' if prepared else
                                     'Reuse existing compatible cache' if reuse_cache else
@@ -444,7 +526,11 @@ def plan(args, *, local_progress=None):
             'verification': getattr(args, 'verify', 'auto'),
             'build': build,
             'kernel_install': 'Pinned Windows Triton / Sage2 wheels; actual kernels checked before readiness' if windows_target else 'Local Sage2 source build / ABI-keyed wheel cache',
-            'git_install': 'Reuse detected Git' if snapshot.get('git') else 'Install verified portable MinGit locally after confirmation' if windows_target else 'Git required',
+            'git_install': ('Reuse detected Git' if snapshot.get('git') else
+                            ('Install verified portable MinGit locally' if windows_target else
+                             'Install verified portable Git from conda-forge locally') + (
+                                ' (the detected Git is older than %d.%d)' % git_floor(hardware.system)
+                                if snapshot.get('git_found') else '')),
             'wheel_cache': str(Path(getattr(args, 'wheel_cache', None) or saved.get('wheel_cache') or root / 'wheels').expanduser().resolve()),
             'rebuild_sage': getattr(args, 'rebuild_sage', False),
             'model_download_bytes': sum(r['bytes'] for r in files) - present - (local_reuse or {}).get('reused_bytes', 0),
@@ -506,7 +592,8 @@ def display(value, ui=None, *, verbose=False):
         rows.append((label, '~%.1f GiB additional needed · %.1f GiB free' % (disk['needed_bytes']/GiB, disk['free_bytes']/GiB)))
     prepared = value.get('prepared_model')
     rows.append(('Storage', 'Download slim %s model · no local conversion' % prepared_precision(prepared) if prepared else
-                 'Reuse prepared FP8 cache' if value['reuse_cache'] else 'Prepare compact FP8 model'))
+                 ('Reuse prepared %s cache' % ('ConvRot int8' if value.get('prepared_format') == 'int8_convrot' else 'FP8'))
+                 if value['reuse_cache'] else 'Prepare compact FP8 model'))
     if prepared:
         rows.append(('Prepared model', prepared['repo'] + ' · ' + prepared['scale_granularity'] +
                      (' · private, authorized HF token required' if prepared.get('private') else '')))
@@ -618,7 +705,7 @@ def confirmed(args, value, ask=input, ui=None):
         if not args.yes or not args.accept_model_license:
             raise ValueError('--approved-plan requires explicit plan/license acceptance.')
         reviewed = json.loads(Path(reviewed_path).read_text(encoding='utf-8'))
-        keys = ('root', 'engine_version', 'environment_layout', 'model_dir', 'encoder_dir', 'vram_gib', 'ram_gib', 'reuse_cache', 'storage', 'storage_cleanup', 'model_downloader', 'prepared_model', 'model_source', 'disk_mode', 'frontend', 'sampling_caches')
+        keys = ('root', 'engine_version', 'environment_layout', 'model_dir', 'encoder_dir', 'vram_gib', 'ram_gib', 'reuse_cache', 'storage', 'storage_cleanup', 'model_downloader', 'prepared_model', 'prepared_format', 'model_source', 'disk_mode', 'frontend', 'sampling_caches')
         changed = any(reviewed.get(key) != value.get(key) for key in keys)
         changed |= reviewed.get('device_backend') != value.get('device_backend')
         if value.get('device_backend') == 'mps':
@@ -708,7 +795,7 @@ def setup_task(label):
         'vdn-source': ('Download model code', 'Prepare model source files while runtime packages download'),
         'library-check': ('Check text encoder', 'Verify that the text encoding library loads'),
         'models': ('Download model weights', 'Download and verify the video model and text encoder'),
-        'prepare': ('Optimize model storage', 'Prepare compact FP8 weights for your GPU'),
+        'prepare': ('Optimize model storage', 'Prepare the model weights for your GPU'),
         'kernels': ('Test GPU acceleration', 'Run small checks on your GPU'),
         'storage': ('Finish model storage', 'Verify prepared weights and apply your storage choice'),
         'dependency-check': ('Check installed packages', 'Verify dependency compatibility'),
@@ -718,6 +805,8 @@ def setup_task(label):
         'sage2-wheel-install': ('Install SageAttention 2', 'Install the prepared GPU acceleration package'),
         'sage2-windows-wheel-install': ('Install SageAttention 2', 'Install the verified Windows acceleration package'),
         'windows-runtime-check': ('Check GPU runtime', 'Verify CUDA and the Windows runtime libraries'),
+        'portable-git': ('Prepare Git', 'Install the verified Git packages'),
+        'portable-git-check': ('Prepare Git', 'Check the installed Git'),
     }
     title, detail = tasks.get(key, ('Prepare dependencies', 'Prepare verified source files'))
     for prefix, name in (('h3-text-encoder-', 'text encoder'), ('SageAttention-', 'SageAttention 2')):
@@ -779,16 +868,13 @@ class Installer:
         if previous.is_file():
             shutil.copyfile(previous, self.run_dir / 'machine.before.json')
             saved = json.loads(previous.read_text(encoding='utf-8'))
-        # Persist a confirmed choice for interrupted first installs and upgrades.
-        # The former complete configuration is retained in machine.before.json.
-        save(previous, dict(saved, root=str(self.root), ready=False, setup_run=str(self.run_dir),
-            storage=value.get('storage', 'compact'),
-            disk_mode=value.get('disk_mode', 'normal'),
-            pending_environment_layout=self.layout, model_root=value['model_dir'],
-            encoder_model_root=value.get('encoder_dir', saved.get('encoder_model_root')),
-            wheel_cache=value.get('wheel_cache', saved.get('wheel_cache')),
-            vram_gib=value.get('vram_gib', saved.get('vram_gib')),
-            ram_gib=value.get('ram_gib', saved.get('ram_gib'))))
+        self.saved = saved
+        # Moving a working installation to int8 checks the int8 kernels first
+        # (execute), so a GPU that fails them keeps its configuration as it was.
+        self.int8_check_first = (value.get('prepared_format') == 'int8_convrot' and saved.get('ready') is True
+                                 and self.system != 'Darwin' and self.pythons['engine'].is_file())
+        if not self.int8_check_first:
+            self.mark_unfinished()
         self.env = dict(os.environ, FREEVIDEO_HOME=str(self.root),
             FREEVIDEO_VDN_ROOT=str(self.root / 'vendor' / 'vdn'),
             FREEVIDEO_MODEL_ROOT=value['model_dir'],
@@ -820,6 +906,21 @@ class Installer:
         self.monitor_stop = threading.Event()
         self.monitor_thread = None
         self.started = time.monotonic()
+
+    def mark_unfinished(self):
+        """Persist a confirmed choice for interrupted first installs and upgrades.
+
+        The former complete configuration is retained in machine.before.json.
+        """
+        value, saved = self.plan, self.saved
+        save(self.root / 'machine.json', dict(saved, root=str(self.root), ready=False, setup_run=str(self.run_dir),
+            storage=value.get('storage', 'compact'),
+            disk_mode=value.get('disk_mode', 'normal'),
+            pending_environment_layout=self.layout, model_root=value['model_dir'],
+            encoder_model_root=value.get('encoder_dir', saved.get('encoder_model_root')),
+            wheel_cache=value.get('wheel_cache', saved.get('wheel_cache')),
+            vram_gib=value.get('vram_gib', saved.get('vram_gib')),
+            ram_gib=value.get('ram_gib', saved.get('ram_gib'))))
 
     def device_environment(self, env):
         from .triton_compat import environment
@@ -965,10 +1066,11 @@ class Installer:
         from .package_progress import PackageOutput
         if self.cancel.is_set():
             raise RuntimeError(self.state.get('resource_guard', 'Installation cancelled.'))
+        args, cwd = uv_file_arguments(args, cwd)
         with self.state_lock:
             index = len(self.state['steps'])
             log = self.run_dir / ('%02d-%s.log' % (index, label))
-            row = {'label': label, 'command': list(map(str, args)), 'log': str(log), 'status': 'running'}
+            row = {'label': label, 'command': args, 'log': str(log), 'status': 'running'}
             self.state['steps'].append(row)
             save(self.run_dir / 'status.json', self.state)
         key = str(index) + '-' + label
@@ -999,7 +1101,8 @@ class Installer:
             with log.open('w', encoding='utf-8') as stream:
                 with PackageOutput(row['command'], stream, env or self.env) as output:
                     child = processes.popen(row['command'], env=output.env, cwd=cwd, stdout=output.stdout, stderr=subprocess.STDOUT,
-                                             start_new_session=True, pass_fds=(self.runtime_fd,), supervise=True)
+                                             start_new_session=True, supervise=True,
+                                             pass_fds=() if self.runtime_fd is None else (self.runtime_fd,))
                     output.spawned()
                     try:
                         while child.poll() is None:
@@ -1047,7 +1150,7 @@ class Installer:
         def task(name, run, after=(), writes=()):
             tasks[name] = dict(run=run, after=tuple(after), writes=tuple(writes))
         task('python', lambda: self.python_install(uv))
-        task('git', self.install_git_windows if self.system == 'Windows' else lambda: None)
+        task('git', self.install_git)
         # This entry imports only stdlib engine code from the bootstrap Python.
         # It can fetch the exact source trees while large Torch wheels download.
         task('vdn-source', lambda: self.command('vdn-source', [sys.executable, '-c',
@@ -1116,12 +1219,13 @@ class Installer:
                 'assert torch.cuda.is_available(), "CUDA unavailable; check NVIDIA driver and Windows DLL errors above"; '
                 'print("Windows runtime imports passed; GPU kernel probes follow")']), ('runtime',), ('environment:' + name,))
         overlap = (self.plan.get('model_transfer') or {}).get('overlap_build', True)
-        task('sage', lambda: self.install_sage(uv, python), ('runtime',) if overlap else ('runtime', 'models'),
+        # Linux builds SageAttention from a Git checkout.
+        task('sage', lambda: self.install_sage(uv, python), ('runtime', 'git') if overlap else ('runtime', 'git', 'models'),
              ('environment:' + name,))
         if self.plan.get('disk_mode') == 'extreme':
             # Finish all environments before models occupy most of the disk.
             # In particular retain the uv cache until ComfyUI has reused it.
-            tasks['sage']['after'] = ('runtime',)
+            tasks['sage']['after'] = ('runtime', 'git')
             prerequisites = tuple(key for key in tasks if key != 'models')
             frontend = self.plan.get('frontend') or {}
             if frontend.get('separate'):
@@ -1268,8 +1372,85 @@ class Installer:
         save(self.run_dir / 'sage-wheel.json', record)
         return manifest
 
+    def install_git(self):
+        if self.system == 'Windows':
+            self.install_git_windows()
+        elif self.system == 'Linux' and not usable_git(self.env['PATH'], self.env):
+            self.install_git_linux()
+
+    def install_git_linux(self):
+        """Git from conda-forge, pinned by package hashes, when the system has none new enough."""
+        spec = json.loads((PACKAGE / 'git_linux.json').read_text(encoding='utf-8'))
+        prefix = self.root / 'tools' / ('git-' + spec['version'])
+        executable = prefix / 'bin' / 'git'
+        receipt, content = prefix / '.freevideo-git.json', {k: spec[k] for k in ('version', 'packages')}
+        if not (receipt.is_file() and json.loads(receipt.read_text(encoding='utf-8')) == content and executable.is_file()):
+            micromamba, packages = self.fetch_git_linux(spec)
+            # conda writes the prefix into the installed files, so the
+            # environment is created in place; an interrupted one is replaced.
+            if prefix.is_symlink():
+                prefix.unlink()
+            elif prefix.exists():
+                shutil.rmtree(prefix)
+            explicit = self.root / 'downloads' / 'git-linux' / 'explicit.txt'
+            explicit.write_text('@EXPLICIT\n' + ''.join(path.resolve().as_uri() + '\n' for path in packages), encoding='utf-8')
+            cache = self.root / 'tools' / 'micromamba-root'
+            env = {k: v for k, v in self.env.items() if not k.upper().startswith(('CONDA', 'MAMBA'))}
+            self.command('portable-git', [micromamba, 'create', '--yes', '--no-rc', '--offline',
+                                          '--root-prefix', cache, '--prefix', prefix, '--file', explicit], env=env)
+            save(receipt, content)
+            # Only the environment is kept; a damaged one is downloaded again.
+            shutil.rmtree(cache, ignore_errors=True)
+            shutil.rmtree(explicit.parent, ignore_errors=True)
+            micromamba.unlink(missing_ok=True)
+        # PATH, here and in machine.json for ComfyUI, gains only `git`, not
+        # the other tools of the environment.
+        links = self.root / 'tools' / 'git-bin'
+        links.mkdir(parents=True, exist_ok=True)
+        if not (links / 'git').is_symlink() or Path(os.readlink(links / 'git')) != executable:
+            (links / 'git').unlink(missing_ok=True)
+            (links / 'git').symlink_to(executable)
+        self.env['PATH'] = str(links) + os.pathsep + self.env['PATH']
+        self.command('portable-git-check', [links / 'git', '--version'])
+        self.env['FREEVIDEO_GIT'] = str(links / 'git')
+
+    def fetch_git_linux(self, spec):
+        """micromamba and the locked packages, verified by SHA-256, as one step."""
+        directory = self.root / 'downloads' / 'git-linux'
+        tool = spec['micromamba']
+        micromamba = self.root / 'tools' / ('micromamba-' + tool['version'])
+        channels = spec['channels']
+        # Mainland mirrors first when the measured PyPI ranking prefers one.
+        mirrors = [n for n in channels if n != 'official']
+        names = (mirrors + ['official'] if network.ordered(self.network, 'pypi')[0] in mirrors else
+                 ['official'] + mirrors)
+        rows = [(micromamba, network.urls(self.network, 'github', tool['url'], self.env), tool)]
+        rows += [(directory / row['path'].split('/')[-1], [(n, channels[n] + '/' + row['path']) for n in names], row)
+                 for row in spec['packages']]
+        total = sum(row['bytes'] for _, _, row in rows)
+        key = 'download-git-linux'
+        self.ui.begin(key, 'Prepare Git', detail='Download and verify Git %s' % spec['version'])
+        done = 0
+        try:
+            for path, candidates, row in rows:
+                def progress(current, size, speed, before=done):
+                    if self.cancel.is_set():
+                        raise RuntimeError('Installation cancelled; partial download retained.')
+                    self.ui.update(key, done=before + current, total=total, rate=speed, unit='bytes', scope='git',
+                                   detail='%.1f MiB / %.1f MiB' % ((before + current) / 2**20, total / 2**20))
+                network.download(candidates, path, row['sha256'], progress, network=dict(self.network, quiet=True),
+                                 env=self.env, size=row['bytes'], category='github' if path == micromamba else 'download')
+                done += row['bytes']
+        except BaseException:
+            self.ui.end(key, success=False)
+            raise
+        micromamba.chmod(0o755)
+        self.ui.end(key, detail='Verified and ready')
+        return micromamba, [path for path, _, _ in rows[1:]]
+
     def install_git_windows(self):
-        if shutil.which('git', path=self.env['PATH']):
+        # An older Git on PATH cannot fetch the pinned sources; use the portable one.
+        if usable_git(self.env['PATH'], self.env):
             return
         spec = self.versions['windows']['git']
         archive = self.root / 'downloads' / ('MinGit-' + spec['version'] + '.zip')
@@ -1306,6 +1487,30 @@ class Installer:
             raise RuntimeError('CUDA toolkit is incomplete: ' + str(toolkit))
         save(receipt, spec)
         return toolkit
+
+    def machine_configuration(self, python, encoder_python, comfy, prepared):
+        """The complete machine.json written once every setup step has passed."""
+        return {'schema_version': 1, 'root': str(self.root), 'source': str(SOURCE),
+            'storage': self.plan.get('storage', 'compact'),
+            'disk_mode': self.plan.get('disk_mode', 'normal'),
+            'environment_layout': self.layout,
+            'system': self.system, 'engine_version': __version__,
+            'git': self.env.get('FREEVIDEO_GIT') or shutil.which('git', path=self.env['PATH']),
+            'platform_validation': 'Local dependency and small GPU probes passed; full consumer-GPU validation comes from user test reports.',
+            'kernel_capabilities': str(self.root / 'kernel-capabilities.json'),
+            'python': str(python), 'comfy_python': str(encoder_python), 'comfy_root': str(comfy),
+            'vdn_root': str(self.root / 'vendor' / 'vdn'), 'model_root': self.plan['model_dir'],
+            'encoder_model_root': self.plan['encoder_dir'], 'wheel_cache': self.plan['wheel_cache'],
+            'base': str(Path(self.plan['model_dir']) / 'h3-base'),
+            'checkpoint': str(Path(self.plan['model_dir']) / 'stage-dmd-step-250'),
+            'cache': json.loads(prepared.read_text(encoding='utf-8'))['cache'],
+            'encoder': self.spec['models']['encoder_file'].split('/')[-1],
+            'model_paths': str(self.root / 'encoder-paths.yaml'),
+            **self.device_configuration(),
+            'vram_gib': self.plan.get('vram_gib'), 'ram_gib': self.plan.get('ram_gib'),
+            'model_revision': self.spec['models']['vdn_revision'],
+            'prepared_format': self.plan.get('prepared_format', 'fp8'),
+            'setup_run': str(self.run_dir), 'ready': True}
 
     def device_configuration(self):
         return {'gpu_uuid': self.plan['inventory']['selected_gpu']['uuid']}
@@ -1356,6 +1561,14 @@ class Installer:
         return uv
 
     def execute(self):
+        if self.int8_check_first:
+            # The installed environment runs this source's probes (PYTHONPATH);
+            # the receipt is reused by the check after installation.
+            self.ui.phase('Verify installation on your GPU', 0, 8)
+            report = self.run_dir / 'kernel-capabilities.before.json'
+            self.check_kernels(self.pythons['engine'], report)
+            require_int8_kernels(self.plan, report)
+            self.mark_unfinished()
         self.ui.phase('Prepare download tools', 0, 8)
         uv = self.prepare_tools()
         self.env['FREEVIDEO_UV'] = str(uv)
@@ -1383,30 +1596,12 @@ class Installer:
             self.command(name + '-freeze', [uv, 'pip', 'freeze', '--python', executable])
         kernel_report = self.run_dir / 'kernel-capabilities.json'
         self.check_kernels(python, kernel_report)
+        require_int8_kernels(self.plan, kernel_report)
         self.command('storage', [python, '-m', 'freevideo_engine.provision', '--plan', self.run_dir / 'plan.json',
                                  '--cleanup', '--out', self.run_dir / 'storage.json'])
         self.record_kernel_validation(results, kernel_report)
         self.ui.phase('Finish setup', total - 1, total)
-        configuration = {'schema_version': 1, 'root': str(self.root), 'source': str(SOURCE),
-            'storage': self.plan.get('storage', 'compact'),
-            'disk_mode': self.plan.get('disk_mode', 'normal'),
-            'environment_layout': self.layout,
-            'system': self.system, 'engine_version': __version__,
-            'git': self.env.get('FREEVIDEO_GIT') or shutil.which('git', path=self.env['PATH']),
-            'platform_validation': 'Local dependency and small GPU probes passed; full consumer-GPU validation comes from user test reports.',
-            'kernel_capabilities': str(self.root / 'kernel-capabilities.json'),
-            'python': str(python), 'comfy_python': str(encoder_python), 'comfy_root': str(comfy),
-            'vdn_root': str(self.root / 'vendor' / 'vdn'), 'model_root': self.plan['model_dir'],
-            'encoder_model_root': self.plan['encoder_dir'], 'wheel_cache': self.plan['wheel_cache'],
-            'base': str(Path(self.plan['model_dir']) / 'h3-base'),
-            'checkpoint': str(Path(self.plan['model_dir']) / 'stage-dmd-step-250'),
-            'cache': json.loads(prepared.read_text(encoding='utf-8'))['cache'],
-            'encoder': self.spec['models']['encoder_file'].split('/')[-1],
-            'model_paths': str(self.root / 'encoder-paths.yaml'),
-            **self.device_configuration(),
-            'vram_gib': self.plan.get('vram_gib'), 'ram_gib': self.plan.get('ram_gib'),
-            'model_revision': self.spec['models']['vdn_revision'],
-            'setup_run': str(self.run_dir), 'ready': True}
+        configuration = self.machine_configuration(python, encoder_python, comfy, prepared)
         # Commit readiness only after all steps pass. Failed/rerun setup files
         # remain available, and no model/output cleanup runs automatically.
         self.monitor_stop.set()
@@ -1416,6 +1611,71 @@ class Installer:
         save(self.root / 'machine.json', configuration)
         self.ui.phase('Setup complete', total, total)
         return configuration
+
+
+class Prefetcher:
+    """Download the prepared model an installation is switching to, beside the one in use.
+
+    provision --prefetch holds the setup lease (no concurrent setup run) and
+    nothing else: a running request keeps the engine lease, so generation
+    continues on the installed model. machine.json is unchanged and nothing
+    is removed. Progress uses the installer's step reporting.
+    """
+    command = Installer.command
+
+    def __init__(self, value, ui=None):
+        self.plan = value
+        self.root = Path(value['root'])
+        self.system = value['inventory'].get('hardware', {}).get('system', platform.system())
+        self.layout = value.get('environment_layout', 'unified')
+        self.pythons = role_pythons(self.root, self.layout, self.system)
+        self.runtime_fd = None
+        self.run_dir = self.root / 'setup-runs' / (time.strftime('%Y%m%dT%H%M%SZ', time.gmtime()) + '-prefetch-' + str(os.getpid()))
+        self.run_dir.mkdir(parents=True, exist_ok=False)
+        save(self.run_dir / 'plan.json', value)
+        env = dict(os.environ, FREEVIDEO_HOME=str(self.root), FREEVIDEO_MODEL_ROOT=value['model_dir'],
+                   HF_HOME=str(self.root / 'downloads' / 'huggingface'), HF_HUB_DISABLE_TELEMETRY='1',
+                   HF_HUB_OFFLINE='0', TRANSFORMERS_OFFLINE='0', PYTHONUNBUFFERED='1', PYTHONUTF8='1',
+                   PYTHONIOENCODING='utf-8', PYTHONPATH=str(SOURCE),
+                   FREEVIDEO_NETWORK_PLAN=str(self.run_dir / 'plan.json'),
+                   FREEVIDEO_NETWORK_EVENTS=str(self.run_dir / 'network.jsonl'))
+        env.pop(LOCK_ENV, None)
+        self.env = network.proxy_environment(env)
+        self.state = {'status': 'running', 'steps': [], 'plan': value, 'prefetch': True}
+        self.state_lock = threading.Lock()
+        self.cancel = threading.Event()
+        self.ui = ui or TerminalUI('Model download', plain=True)
+
+    def run(self):
+        out = self.run_dir / 'prefetch.json'
+        self.ui.phase('Download the faster model', 1, 2)
+        self.command('models', [self.pythons['engine'], '-m', 'freevideo_engine.provision',
+                                '--plan', self.run_dir / 'plan.json', '--prefetch', '--out', out])
+        result = json.loads(out.read_text(encoding='utf-8'))
+        self.state.update(status='complete' if result.get('complete') else 'incomplete', result=result)
+        save(self.run_dir / 'status.json', self.state)
+        self.ui.phase('Model downloaded' if result.get('complete') else 'Model download incomplete', 2, 2)
+        return result
+
+
+def run_prefetch(value, ui):
+    try:
+        prefetcher = Prefetcher(value, ui)
+        ui.start(prefetcher.run_dir)
+        result = prefetcher.run()
+    except BaseException as error:
+        message = str(error) if not isinstance(error, KeyboardInterrupt) else 'Stopped'
+        ui.event('failure', error=message)
+        print('\nModel download stopped: %s\nThe installed model is unchanged and still in use; downloaded files '
+              'are kept for the next attempt.' % message, file=sys.stderr)
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+    finally:
+        ui.close()
+    if not result.get('complete'):
+        print('\nSome model files are still missing; run the download again.', file=sys.stderr)
+        return 1
+    print('\nThe model is downloaded and verified. Run setup with the same --prepared-format to switch to it.')
+    return 0
 
 
 def main(argv=None):
@@ -1428,6 +1688,12 @@ def main(argv=None):
     parser.add_argument('--sampling-caches', action=argparse.BooleanOptionalAction, default=None,
                         help='Install every quality level in advance (default for new installations; existing ones keep '
                              'their choice). The default 8 + 3 refinement tables are always installed.')
+    parser.add_argument('--prepared-format', choices=('auto', 'int8', 'fp8'), default='auto',
+                        help='auto: an installation keeps its recorded format and new installations use int8 on GeForce '
+                             'and Ampere cards, FP8 elsewhere. int8/fp8 switch explicitly; files of the other format are kept')
+    parser.add_argument('--prefetch-only', action='store_true',
+                        help='With --prepared-format: download and verify that model beside the installed one, which stays '
+                             'in use. No other setup step runs and machine.json is unchanged')
     parser.add_argument('--model-source', choices=('prepared', 'source'), default='prepared',
                         help='Default: download a pinned slim model matching the GPU format. source: explicitly download original weights and convert locally')
     parser.add_argument('--encoder-models', type=Path, help='Directory containing text_encoders/')
@@ -1474,6 +1740,8 @@ def main(argv=None):
         parser.error('--auto-resources cannot be combined with --vram-gib or --ram-gib')
     if args.copy_existing_models and not (args.reuse_models or args.reuse_models_manifest):
         parser.error('--copy-existing-models requires --reuse-models or --reuse-models-manifest')
+    if args.prefetch_only and args.prepared_format == 'auto':
+        parser.error('--prefetch-only needs --prepared-format int8 or fp8')
     ui = TerminalUI(platform.system() + ' setup', plain=args.plain, no_color=args.no_color,
                     verbose=args.verbose, show_location=args.verbose)
     try:
@@ -1503,6 +1771,8 @@ def main(argv=None):
     if not accepted:
         print('Cancelled. No engine or model installation was started.')
         return 0
+    if args.prefetch_only:
+        return run_prefetch(value, ui)
     try:
         installer_class = Installer
         if value.get('device_backend') == 'mps':

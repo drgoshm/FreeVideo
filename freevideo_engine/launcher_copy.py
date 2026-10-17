@@ -45,7 +45,8 @@ ZH = dict([
     ('Prepare ComfyUI GPU packages', '准备 ComfyUI 加速组件'),
     ('Install ComfyUI packages', '安装 ComfyUI 组件'), ('Check ComfyUI dependencies', '检查 ComfyUI 环境'),
     ('Finish ComfyUI setup', '完成 ComfyUI 安装'), ('ComfyUI ready', 'ComfyUI 已就绪'),
-    ('Prepare ComfyUI', '准备 ComfyUI'), ('Install FreeVideo workflow', '安装 FreeVideo 工作流'),
+    ('Prepare ComfyUI', '准备 ComfyUI'), ('Update ComfyUI packages', '更新 ComfyUI 组件'),
+    ('Install FreeVideo workflow', '安装 FreeVideo 工作流'),
     ('Open ComfyUI', '打开 ComfyUI'), ('Starting ComfyUI', '启动 ComfyUI'),
     ('Loading nodes and the web interface', '加载节点与界面'),
     ('Checking configuration', '检查配置'), ('Check installation', '检查安装'),
@@ -66,6 +67,7 @@ ZH = dict([
     ('Verify that the text encoding library loads', '检查文本编码器'),
     ('Download and verify the video model and text encoder', '下载并校验模型'),
     ('Prepare compact FP8 weights for your GPU', '准备适配显卡的模型'),
+    ('Prepare the model weights for your GPU', '准备适配显卡的模型'),
     ('Run small checks on your GPU', '检查 GPU 加速是否可用'),
     ('Verify prepared weights and apply your storage choice', '校验模型文件'),
     ('Verify dependency compatibility', '检查运行组件'),
@@ -117,7 +119,7 @@ def source_name(value, zh=False):
 def display(value, zh=False):
     value = clean(value)
     if not zh:
-        return {'检查配套包': 'Checking packages'}.get(value, value)
+        return {'检查配套包': 'Checking packages', '下载模型': 'Downloading models'}.get(value, value)
     if value in ZH:
         return ZH[value]
     if value in SOURCES:

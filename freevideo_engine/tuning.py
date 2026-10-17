@@ -22,10 +22,10 @@ from .paths import data_root
 SCHEMA = 1
 COMPUTE_FILES = ('activation_staging.py', 'residual.py', 'adaln.py', 'adaln_assets.py', 'attention.py', 'blocks.py',
                  'keyframes.py', 'media_request.py', 'media_conditioning.py', 'media_encoding.py', 'reference_sampler.py', 'lora_cache.py',
-                 'conditioning.py', 'decode.py', 'decode_prefetch.py', 'resident_models.py', 'decode_stream.py', 'streamed_weights.py', 'encode_worker.py', 'idle_encoder.py', 'media_encoding.py', 'fp8.py', 'fp8_ops.py', 'fp8_gemm.py',
+                 'conditioning.py', 'decode.py', 'decode_prefetch.py', 'resident_models.py', 'decode_stream.py', 'streamed_weights.py', 'encode_worker.py', 'idle_encoder.py', 'media_encoding.py', 'fp8.py', 'fp8_ops.py', 'fp8_gemm.py', 'int8_ops.py',
                  'encoder_precision.py', 'encoder_lowmem.py',
                  'kernel_capabilities.py', 'gpu_budget.py', 'worker.py', 'resident_worker.py', 'failure_cleanup.py',
-                 'geometry.py', 'head_chunk.py', 'offload.py', 'packing.py', 'runtime.py',
+                 'geometry.py', 'head_chunk.py', 'rocm_ffn.py', 'rocm_attention.py', 'rocm_spatial.py', 'rocm_compat.py', 'offload.py', 'packing.py', 'runtime.py',
                  'two_pass.py', 'two_pass_metrics.py', 'refine.py', 'latent_upscale.py',
                  'vae_tiles.py', 'weight_only.py', 'weights.py')
 PACKAGES = ('torch', 'triton', 'triton-windows', 'transformers', 'tokenizers', 'sageattention', 'numpy',
@@ -84,6 +84,13 @@ def frozen_versions(text):
 
 
 def identity(machine, hardware):
+    # Saved optimization reports use bootstrap's NVIDIA-only inventory and
+    # driver identity. Do not probe nvidia-smi or reuse those profiles on HIP.
+    # generate treats ValueError as unavailable optional tuning and continues
+    # with the live automatic resource policy.
+    if hardware.hip_version:
+        raise ValueError('Saved NVIDIA optimization profiles are unavailable on ROCm; '
+                         'using automatic resource planning')
     from .bootstrap import inventory, model_target
     from .install_tuning import required_models
     observed = inventory(machine['gpu_uuid'])

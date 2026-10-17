@@ -1,4 +1,5 @@
 // One whole-video estimate shared by Studio and node view; real stage counters remain separate.
+import { saveReport } from './report_issue.js';
 const css = document.createElement('link');
 css.rel = 'stylesheet'; css.href = new URL('./generation_progress.css', import.meta.url).href;
 document.head.append(css);
@@ -41,8 +42,32 @@ function encodingLabel(label, t) {
     return t(...(labels[label] || ['Preparing prompt and references', '准备提示词与参考素材']));
 }
 
+// The bridge describes the sampling plan in English; say it in the UI language.
+function planText(message, t) {
+    const plan = message.sampling_plan, first = plan?.first, second = plan?.second;
+    if (!plan || !first) return null;
+    const base = plan.base_steps ?? 8, refine = plan.refine_steps ?? 3;
+    if (plan.enabled && plan.preview) return {
+        label: t(`First-pass preview · ${first.width} × ${first.height} · ${base} steps`, `一采预览 · ${first.width} × ${first.height} · ${base} 步`),
+        detail: t('Run the second pass from the result when it looks right', '满意后在结果中继续二采')};
+    if (plan.enabled && second) return {
+        label: t(`Two-pass · ${first.width} × ${first.height} → ${second.width} × ${second.height} · ${base} + ${refine} steps`,
+            `二次采样 · ${first.width} × ${first.height} → ${second.width} × ${second.height} · ${base} + ${refine} 步`),
+        detail: t('Audio is preserved from the first pass', '音频沿用一采结果')};
+    return {label: t(`Single-pass · ${base} steps`, `单次采样 · ${base} 步`), detail: message.detail || ''};
+}
+
 // A reference clip longer than the video being generated is cut to the same
 // length, at most 15 s, as in the official pipeline. Say so; never cut silently.
+// The driver held the clock down for heat for most of the run (summary.thermal).
+export function thermalText(thermal, t) {
+    const share = thermal.sm_clock_max_mhz ? Math.round(100 * thermal.sm_clock_mean_mhz / thermal.sm_clock_max_mhz) : null;
+    const heat = Number.isFinite(thermal.temperature_mean_c) ? Math.round(thermal.temperature_mean_c) : null;
+    const detail = [heat !== null ? `${heat} °C` : '', share !== null ? t(`${share}% of its peak clock`, `频率只有峰值的 ${share}%`) : ''].filter(Boolean).join(t(', ', '，'));
+    return t(`The GPU spent most of this video in thermal slowdown${detail ? ` (${detail})` : ''}, so it took much longer than usual. Improve cooling; on a laptop, plug in and choose a high-performance power mode.`,
+        `生成这段视频时，显卡大部分时间因过热降频${detail ? `（${detail}）` : ''}，所以比平时慢很多。请改善散热；笔记本请接通电源并选择高性能模式。`);
+}
+
 export function referenceTrimText(row, t) {
     const kind = row?.kind === 'audio' ? t('Reference audio', '参考音频') : t('Reference video', '参考视频');
     const name = Number.isInteger(row?.number) ? `${kind} ${row.number}` : kind;
@@ -71,9 +96,11 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
     recovery.setAttribute('role', 'status');
     const silence = el('div', 'fv-generation-silence'); silence.hidden = true;
     const notice = el('p', 'fv-generation-note fv-generation-notice'); notice.hidden = true;
+    const lowMemory = el('p', 'fv-generation-note fv-generation-memory'); lowMemory.hidden = true;
+    lowMemory.setAttribute('role', 'status');
     notice.setAttribute('role', 'status');
     const trims = new Map();
-    element.append(heading, track, detail, times, silence, recovery, notice, note);
+    element.append(heading, track, detail, times, silence, recovery, lowMemory, notice, note);
     let state = {}, overall = {}, started = 0, sampledAt = 0, overallAt = 0, timer = null;
     let shownFraction = null;
     // The visible percentage counts toward its value with the bar instead of
@@ -117,18 +144,16 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
         // only a new request clears it.
         return reportId;
     }
-    // Download the redacted diagnostic export; throws when it is unavailable.
-    async function downloadReport() {
+    // The redacted diagnostic export; throws when it is unavailable.
+    async function fetchReport() {
         const id = reportId;
         if (!id) throw new Error('Report unavailable');
         const path = `/freevideo/report/${id}`;
         const response = await (api ? api.fetchApi(path) : fetch(path));
         if (!response.ok) throw new Error('Report unavailable');
-        const blob = await response.blob(), url = URL.createObjectURL(blob);
-        const link = document.createElement('a'); link.href = url; link.download = 'video.debug.json';
-        document.body.append(link); link.click(); link.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 1000);
+        return response.blob();
     }
+    async function downloadReport() { saveReport(await fetchReport()); }
     report.onclick = async () => {
         if (!reportId || report.disabled) return;
         const id = reportId;
@@ -263,6 +288,13 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
             stopCount(); countShown = null;
             recovery.hidden = true; recovery.textContent = '';
             trims.clear(); notice.hidden = true; notice.textContent = '';
+            lowMemory.hidden = true; lowMemory.textContent = '';
+        }
+        if (message.low_memory && typeof message.low_memory === 'object') {
+            // Stays for the whole request: the slower steps are expected, not a stall.
+            lowMemory.textContent = t('This GPU has little free memory, so this video uses the low-memory mode. It is slower than usual but will finish. A lower resolution or a shorter video runs faster.',
+                '显存较少，本次使用省显存方式生成，会比平时慢，但能完成。降低分辨率或缩短时长会更快。');
+            lowMemory.hidden = false;
         }
         if (message.reference_trimmed && typeof message.reference_trimmed === 'object') {
             const row = message.reference_trimmed;
@@ -314,7 +346,9 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
                 transformer_release: t('Preparing video decoding', '正在准备视频解码'),
             }[message.stage] || t('Preparing video decoding', '正在准备视频解码')
             : message.timing_phase === 'encoding' ? encodingLabel(message.label, t)
-            : message.label || t('Preparing video', '正在准备视频');
+            : message.stage === 'preview_mismatch'
+                ? t('The preview no longer matches; generating the whole video', '预览的中间结果已对不上，改为完整生成')
+            : planText(message, t)?.label || message.label || t('Preparing video', '正在准备视频');
         if (compact && !complete) {
             const phase = message.phase || message.timing_phase;
             label.textContent = sampling ? `${t('Sampling', '采样')} ${message.done} / ${message.total}`
@@ -338,7 +372,7 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
                 : message.stage === 'inputs' ? t('Preparing sampling inputs', '正在准备采样输入')
                 : message.done > 0 ? t(`${message.done} steps complete`, `已完成 ${message.done} 步`)
                 : t('Starting the first step', '正在开始第一步');
-        } else detail.textContent = message.detail || '';
+        } else detail.textContent = planText(message, t)?.detail ?? message.detail ?? '';
         if ((downloadLabel || message.phase === 'dependencies') && valid(message.done) && valid(message.total)) {
             detail.textContent = `${(message.done/2**20).toFixed(1)} / ${(message.total/2**20).toFixed(1)} MiB`
                 + (valid(message.bytes_per_second) && message.bytes_per_second > 0 ? ` · ${(message.bytes_per_second/2**20).toFixed(1)} MiB/s` : '');
@@ -352,9 +386,10 @@ export function createGenerationProgress(t, now = () => Date.now(), {compact = f
     function hide() {
         element.hidden = true; recovery.hidden = true; recovery.textContent = '';
         trims.clear(); notice.hidden = true; notice.textContent = '';
+        lowMemory.hidden = true; lowMemory.textContent = '';
         if (timer !== null) clearInterval(timer); timer = null; state = {}; overall = {}; shownFraction = null;
         stopCount(); countShown = null;
     }
-    return {element, report, updateReport, downloadReport, hasReport: () => reportId !== null, update, hide, dispose: hide,
+    return {element, report, updateReport, fetchReport, downloadReport, hasReport: () => reportId !== null, update, hide, dispose: hide,
         noticeCount: () => trims.size};
 }

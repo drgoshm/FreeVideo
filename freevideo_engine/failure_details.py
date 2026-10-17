@@ -73,6 +73,13 @@ def launcher_failure(value, *, zh=False):
         return dict(title='', detail='', action='', kind='')
     text = str(value)
     summary = text.partition(STEP_OUTPUT)[0]
+    disk = re.search(r'Insufficient disk space: need ([\d.]+) GiB, available ([\d.]+) GiB, short ([\d.]+) GiB', summary, re.I)
+    if disk:
+        needed, available, short = disk.groups()
+        return dict(title='磁盘空间不足' if zh else 'Not enough disk space', kind='disk',
+                    detail=('需要 %s GiB，可用 %s GiB。再释放 %s GiB 后点击“重新检查”。' % (needed, available, short)
+                            if zh else 'Need %s GiB; %s GiB available. Free another %s GiB, then click “Check again”.' % (needed, available, short)),
+                    action='重新检查' if zh else 'Check again')
     if text.startswith('ComfyUI could not start.'):
         return dict(title='ComfyUI 启动失败' if zh else 'ComfyUI could not start',
                     detail='ComfyUI 进程在启动时退出。' if zh else 'The ComfyUI process exited during startup.',
@@ -91,6 +98,24 @@ def launcher_failure(value, *, zh=False):
                     action='展开详情或导出报告，查看完整检查结果。' if zh else
                            'Open the details or export the report for the complete results.', kind='kernels')
     rules = (
+        (r'Git \d+\.\d+ is too old to download the pinned sources', 'git-version',
+         ('Git is too old', 'Git 版本过旧'),
+         ('Click Retry installation; FreeVideo then installs its own Git. On macOS, update the Command Line Tools.',
+          '请点击“重试安装”，FreeVideo 会改用自带的 Git；macOS 请更新命令行工具（Command Line Tools）。')),
+        (r'installation from offline packages; automatic installation does not change it|'
+         r'Existing dependency is not a Git checkout of the pinned source', 'offline-installation',
+         ('This folder holds an offline installation', '这个位置是离线包安装'),
+         ('Open it from the launcher. For an automatic installation, go back to Setup and choose another folder.',
+          '请在启动页直接打开这份安装。如需自动安装，请回到安装设置，换一个安装位置。')),
+        # web/health.js lists the failed files and what to do on the page itself.
+        (r'The browser page did not load FreeVideo completely|浏览器页面没有完整加载 FreeVideo', 'page',
+         ('FreeVideo did not load completely in the browser', '浏览器里的 FreeVideo 没有完整加载'),
+         ('The browser page names the files that failed and what to do. Follow it, then reload the page; if it happens again, export the report.',
+          '浏览器页面上列出了出错的文件和处理方法。按提示处理后刷新页面；仍然出现时请导出报告。')),
+        (r'The browser has not opened FreeVideo yet|浏览器还没有打开 FreeVideo', 'page-silent',
+         ('The browser has not opened FreeVideo', '浏览器还没有打开 FreeVideo'),
+         ('Click “Open FreeVideo”. If the page stays blank or keeps loading, open it in a current Chrome or Edge.',
+          '请点击“打开 FreeVideo”。如果页面空白或一直在加载，请用最新版 Chrome 或 Edge 打开。')),
         (r'CUDA_ARCH_UNSUPPORTED', 'gpu-architecture',
          ('This GPU lacks the required compute support', '这张显卡不满足当前计算要求'),
          ('The detected GPU and compute capability are shown below. The CUDA runtime requires native BF16 computation (SM80 or newer). Use a compatible GPU; changing the driver does not change its hardware capability.',
@@ -125,11 +150,11 @@ def launcher_failure(value, *, zh=False):
           '关闭占用内存较多的程序后重试，已下载文件会保留。')),
         (r'Installation RAM monitoring failed|Cannot read process-tree memory', 'memory-monitor',
          ('Memory usage could not be read', '暂时无法读取进程内存'),
-         ('Download progress is saved. Check and continue to retry; copy the details if it happens again.',
-          '下载进度已保留。点击“检查并继续”重试；若再次出现，请复制详情反馈。')),
-        (r'No space left on device|WinError 112|disk (?:is )?full', 'disk',
+         ('Download progress is saved. Retry installation; copy the details if it happens again.',
+          '下载进度已保留。点击“重试安装”；若再次出现，请复制详情反馈。')),
+        (r'No space left on device|WinError 112|disk (?:is )?full|Not enough disk space|Insufficient disk space', 'disk',
          ('Not enough disk space', '磁盘空间不足'),
-         ('Free up space on the installation drive, then continue.', '清理安装盘空间后，点击继续。')),
+         ('Free up space on the installation drive, then retry.', '清理安装盘空间后，点击重试。')),
         (r'Model download paused|unexpected-transfer-size|ConnectionError|ConnectTimeout|ReadTimeout|HTTP probe failed|Could not resolve host|SSL certificate|Every download source failed|All Git sources failed|All package sources failed|Python download failed on every route', 'download',
          ('Download interrupted', '下载中断了'),
          ('Check your network or change the source or connection mode in Settings → Downloads, then retry.', '检查网络，或在“设置 → 下载”中切换下载源、连接模式后重试。')),

@@ -125,6 +125,33 @@ def main():
     cli()
 
 
+def suggest_alternatives(error, hardware, options):
+    """Name smaller requests this GPU can run now, when only VRAM refused this one.
+
+    A request with a new prompt is first planned for its text encoder, which
+    already applies the video stage's VRAM floor, so that is where most
+    refusals happen. Suggestions are planned for the video stage either way.
+    """
+    if error.details.get('insufficient') != ['gpu'] or not options.get('canvas'):
+        return
+    from .policy import describe_alternatives, feasible_alternatives
+    try:
+        rows = feasible_alternatives(hardware, options['canvas'],
+                                     **{key: value for key, value in options.items() if key not in ('canvas', 'stage')})
+    except Exception:  # A suggestion is advisory; the refusal stands as planned.
+        return
+    if rows:
+        error.details['alternatives'] = rows
+        error.args = (str(error) + '\n' + describe_alternatives(rows),)
+
+
+def low_memory_mode(engine):
+    """The placements that trade speed for a smaller GPU working set, if this plan uses them."""
+    if engine.get('residual_offload') or engine.get('attention_cpu_outputs'):
+        return dict(staging=bool(engine.get('residual_offload')), host_outputs=bool(engine.get('attention_cpu_outputs')))
+    return None
+
+
 def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environment=None):
     """Plan with idle-cache accounting; reclaim once if it prevents admission."""
     from .hardware import detect
@@ -154,6 +181,10 @@ def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environ
                 planning_canvas['task'] = args.task
             options.update(available_backends=available_backends(hardware, probe_missing=False), canvas=planning_canvas,
                 demonstrated_ram_bytes=demonstrated_local_ram(hardware, args, canvas))
+            cache = getattr(args, 'cache', None)
+            if cache is not None and (Path(cache) / 'manifest.json').is_file():
+                manifest = json.loads((Path(cache) / 'manifest.json').read_text(encoding='utf-8'))
+                options['precision'] = 'int8' if manifest.get('precision') == 'int8' else 'fp8'
             if getattr(args, '_lora_max_block_bytes', 0):
                 options['lora_max_block_bytes'] = args._lora_max_block_bytes
             if getattr(args, '_lora_root_bytes', 0):
@@ -250,6 +281,7 @@ def automatic_profile(args, canvas, *, stage, evidence, descriptor=None, environ
             impossible_capacity = any(error.details[name+'_capacity_bytes'] - error.details[name+'_reserve_bytes']
                                       < error.details[name+'_minimum_bytes'] for name in error.details['insufficient'])
             if attempt or impossible_capacity or not state or not environment.get(ENV):
+                suggest_alternatives(error, hardware, options)
                 raise
         print(json.dumps(dict(event='release_idle_cache', stage=stage,
             reason='Cached models prevent next-stage loading; releasing them and measuring again',
@@ -298,6 +330,10 @@ def _run(args):
     requested_steps = getattr(args, 'base_steps', None)
     refine_steps = getattr(args, 'refine_steps', 3)
     two_pass = getattr(args, 'two_pass', True)
+    preview = getattr(args, 'preview', False) is True
+    from .preview import validate_flags, source as preview_source
+    validate_flags(preview, getattr(args, 'refine_from', None), two_pass)
+    refine_source = preview_source(args.refine_from) if getattr(args, 'refine_from', None) else None
     if requested_steps is not None:
         validate_steps(requested_steps, refine_steps, two_pass)
         if requested_steps != 8:
@@ -321,7 +357,7 @@ def _run(args):
         profile = json.loads(args.profile.read_text(encoding='utf-8'))
     else:
         hardware, resident_credit, profile = automatic_profile(args, canvas, stage='before-encoding', evidence=planning)
-    print(json.dumps(dict(event='compute_device', backend='CUDA', name=getattr(hardware, 'gpu_name', None),
+    print(json.dumps(dict(event='compute_device', backend='ROCm' if hardware.hip_version else 'CUDA', name=getattr(hardware, 'gpu_name', None),
                           uuid=getattr(hardware, 'gpu_uuid', None), vram_total_bytes=getattr(hardware, 'vram_total', None),
                           vram_free_bytes=getattr(hardware, 'vram_free', None))), flush=True)
     allocator_limit_bytes = benchmark_allocator_limit(profile, getattr(args, 'allocator_limit_gib', None), hardware)
@@ -348,8 +384,8 @@ def _run(args):
     if args.out.suffix.lower() != '.mp4':
         raise ValueError('--out must name an MP4 file')
     manifest = json.loads((args.cache / 'manifest.json').read_text(encoding='utf-8'))
-    if manifest.get('precision') != 'fp8':
-        raise ValueError('Select the prepared official FP8 cache')
+    if manifest.get('precision') not in ('fp8', 'int8', 'bf16'):  # BF16: the unquantized reference
+        raise ValueError('Select the prepared official FP8 or int8 cache')
     destination = args.out.resolve()
     if destination.exists():
         raise FileExistsError(destination)
@@ -442,9 +478,15 @@ def _run(args):
                        PYTORCH_ALLOC_CONF=allocator, PYTORCH_CUDA_ALLOC_CONF=allocator)
             env[LOCK_ENV] = str(descriptor)
             condition = temporary / 'conditioning.pt'
-            if args.conditioning:
+            if refine_source:
+                # The preview's own conditioning: the exact file its first pass used.
+                condition = Path(refine_source['conditioning'])
+                if refine_source['report'].get('encoding'):
+                    report['encoding'] = dict(refine_source['report']['encoding'], reused_from_preview=True)
+                print(json.dumps({'event': 'conditioning_reused', 'source': 'preview'}), flush=True)
+            elif args.conditioning:
                 shutil.copyfile(args.conditioning, condition)
-            if args.prompt_file:
+            if args.prompt_file and not refine_source:
                 encoding = {'prompt': args.prompt_file.read_text(encoding='utf-8'), 'encoder': args.encoder,
                             'comfy_root': str(args.comfy_root or comfy_root()),
                             'model_paths': str(args.model_paths.resolve()) if args.model_paths else None,
@@ -486,6 +528,7 @@ def _run(args):
                             encoder_env, descriptor, destination.with_suffix('.encoding.log'),
                             ram_budget_bytes=profile['inference_ram_budget_gb'] * 1e9,
                             ram_budget_is_estimate=ram_budget_is_estimate(args),
+                            gpu=hardware.gpu_uuid if hardware.hip_version else None,
                             minimum_available_bytes=inference_emergency_floor(profile['inference_ram_budget_gb'] * 1e9,
                                 getattr(args, 'ram_reserve_gib', None)),
                             on_start=lambda pid: history.attach_worker(encoder_attempt, pid, phase='encoding'))
@@ -536,9 +579,13 @@ def _run(args):
             sampling_plan = plan_sampling(canvas, two_pass, profile['engine'].get('task', 't2va'),
                                           base_steps=base_steps, refine_steps=refine_steps)
             report['sampling_plan'] = sampling_plan
+            if preview:
+                report['preview'] = dict(geometry=dict(sampling_plan['first'], fps=canvas['fps']))
+            if refine_source:
+                report['upscaled_preview'] = dict(output=refine_source['output'])
             if sampling_plan['enabled'] or sampling_plan['version'] == 2:
                 canvas['sampling_plan'] = sampling_plan
-            print(json.dumps(dict(event='sampling_plan', **sampling_plan)), flush=True)
+            print(json.dumps(dict(event='sampling_plan', **sampling_plan, **({'preview': True} if preview else {}))), flush=True)
             save(destination.with_suffix('.request.json'), report)
             upscaler_checkpoint = None
             if sampling_plan.get('upscaler_sha256'):
@@ -553,6 +600,10 @@ def _run(args):
                 live['engine'].update({k: profile['engine'][k] for k in ('base', 'checkpoint', 'task', 'steps') if k in profile['engine']})
                 profile = live
                 report['profile'] = profile
+                report['low_memory_mode'] = low_memory_mode(profile['engine'])
+                if report['low_memory_mode']:
+                    # Slower than usual but bounded; the panel says so while it runs.
+                    print(json.dumps(dict(event='low_memory_mode', **report['low_memory_mode'])), flush=True)
             from .prediction import predict
             from .prediction_ui import show as show_prediction, errors as prediction_errors
             condition_hash = tuning.digest(condition)
@@ -577,7 +628,7 @@ def _run(args):
                 from .adaptive import recovered_compute
                 profile, report['recovered_compute'] = recovered_compute(profile, history, resource_identity, canvas)
                 report['profile'] = profile
-                if report['recovered_compute']['applied']:
+                if report['recovered_compute']['applied'] or report['recovered_compute'].get('reprobe'):
                     print(json.dumps(dict(event='recovered_compute', **report['recovered_compute'])), flush=True)
             from .compatibility import Store as CompatibilityStore, apply as apply_compatibility
             compatibility_state = CompatibilityStore(history.path.parent).status(resource_identity, persist=True)
@@ -620,18 +671,25 @@ def _run(args):
                        'sampling_plan': sampling_plan, 'upscaler_checkpoint': upscaler_checkpoint,
                        'automatic_pass_cache': not bool(args.profile),
                        'metrics': str(destination.with_suffix('.engine.json'))}
+            if preview:
+                request['preview'] = True
             if allocator_limit_bytes is not None:
                 request['allocator_limit_bytes'] = allocator_limit_bytes
                 report['benchmark_limit'] = {'pytorch_allocator_bytes': request['allocator_limit_bytes'],
                     'scope': 'PyTorch CUDA allocator only; other CUDA allocations and whole-device usage are measured separately.'}
             request_path = temporary / 'video.json'
             resume_decode = resume_refine = None
+            # An upscale reuses its preview's first pass unless a later attempt
+            # retains a newer checkpoint, or the current inputs no longer match.
+            preview_pass = ({key: refine_source[key] for key in ('input', 'metrics', 'request')}
+                            if refine_source else None)
             # Keep explicit dependency overlays while keeping the snapshotted engine first.
             engine_env = dict(env, PYTHONPATH=os.pathsep.join((str(repo), str(vdn_root()),
                                                               env.get('PYTHONPATH', ''))))
             def persist():
                 save(destination.with_suffix('.request.json'), report)
             def launch(selected, attempt):
+                nonlocal preview_pass
                 selected_env = inference_environment(engine_env, selected['inference_ram_budget_gb'] * 1e9)
                 request.update(engine_options=selected['engine'], decoder_options=selected['decoder'],
                                ram_budget_bytes=round(selected['inference_ram_budget_gb'] * 1e9),
@@ -663,6 +721,21 @@ def _run(args):
                     request['resume_refine'] = dict(resume_refine)
                 else:
                     request.pop('resume_refine', None)
+                request.pop('resume_first_pass', None)
+                if resume_decode is None and resume_refine is None and preview_pass is not None:
+                    from .decode_resume import refine_provenance
+                    receipt = json.loads(Path(preview_pass['metrics']).read_text(encoding='utf-8'))
+                    if refine_provenance(request) == receipt.get('refine_provenance'):
+                        request['resume_first_pass'] = dict(preview_pass)
+                        report['upscaled_preview']['first_pass_reused'] = True
+                    else:
+                        # Other models, settings or math: the preview's first pass
+                        # is not this request's. Sample it again instead.
+                        preview_pass = None
+                        report['upscaled_preview'].update(first_pass_reused=False,
+                            reason='The preview no longer matches the current models or settings; '
+                                   'its first pass was sampled again.')
+                        print(json.dumps(dict(event='preview_mismatch')), flush=True)
                 save(request_path, request)
                 print(json.dumps({'event': 'decode_resume' if resume_decode else 'video_start', 'resource_attempt': attempt,
                                   'engine': selected['engine'], 'decoder': selected['decoder']}), flush=True)
@@ -744,7 +817,8 @@ def _run(args):
                 retry_state = dict(attempt=index + 2, max_attempts=getattr(args, 'resource_retries', 2) + 1,
                                    failed_phase=row.get('phase'), kind=row['failure']['kind'],
                                    reuse_sampling=resume_decode is not None,
-                                   reuse_first_pass=resume_decode is None and resume_refine is not None)
+                                   reuse_first_pass=resume_decode is None and (resume_refine is not None
+                                                                               or preview_pass is not None))
                 row['recovery'] = dict(decision, next_profile=selected, **retry_state)
                 persist()
                 print(json.dumps(dict(event='resource_retry', retained=row['retained'], retry=retry_state)), flush=True)
@@ -757,6 +831,11 @@ def _run(args):
                 archive=archive, report=report, persist=persist, on_retry=retry,
                 automatic=not args.profile or getattr(args, 'recover_placement', False),
                 max_retries=getattr(args, 'resource_retries', 2))
+            if preview:
+                # An upscale validates this receipt beside the retained first pass.
+                shutil.copyfile(destination.with_suffix('.engine.json'), artifacts / 'first-pass.engine.json')
+                from .preview import upscale_reads
+                report['preview']['upscale_reads'] = upscale_reads(request['cache'], report['video'], upscaler_checkpoint)
             report['success'] = True
     except BaseException as error:
         from .diagnostic_resources import exception_details

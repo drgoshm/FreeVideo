@@ -13,6 +13,7 @@ import time
 from . import network, processes
 from .comfy_bridge import installation
 from .comfy_environment import isolated_environment
+from .environments import uv_file_arguments
 from .locking import runtime_lock
 from .monitoring import save
 from .package_progress import PackageOutput
@@ -42,6 +43,21 @@ def prepare_for_setup(root, comfy, plan_path):
                    git=os.environ.get('FREEVIDEO_GIT'))
     with runtime_lock(root / 'launcher' / 'host-setup.lock', inherit=False):
         return _prepare(root, comfy, machine, None, frontend.get('download', False))
+
+
+def previous_environment(root, identity):
+    """The environment this ComfyUI used before its requirements changed, if still complete."""
+    try:
+        record = json.loads((root / 'launcher' / 'comfy-host.json').read_text(encoding='utf-8'))
+        environment = Path(record['environment'])
+        previous = json.loads((environment / 'freevideo-host.json').read_text(encoding='utf-8'))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    python = environment / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
+    if (isinstance(previous, dict) and all(previous.get(k) == identity[k] for k in ('comfy', 'engine_python', 'python'))
+            and environment.parent.resolve() == (root / 'envs').resolve() and python.is_file()):
+        return environment
+    return None
 
 
 def _prepare(root, comfy, machine, run, download):
@@ -86,12 +102,13 @@ def _prepare(root, comfy, machine, run, download):
         else:
             log = directory / ('%02d-command.log' % count)
         progress, child, success = LogProgress(log), None, False
+        command, cwd = uv_file_arguments(command, comfy if comfy.is_dir() else root)
         ui.begin(key, label)
         try:
             with log.open('w', encoding='utf-8') as stream:
-                with PackageOutput(list(map(str, command)), stream, environment) as output:
-                    child = processes.popen(list(map(str, command)), env=output.env,
-                        cwd=comfy if comfy.is_dir() else root, stdin=subprocess.DEVNULL,
+                with PackageOutput(command, stream, environment) as output:
+                    child = processes.popen(command, env=output.env,
+                        cwd=cwd, stdin=subprocess.DEVNULL,
                         stdout=output.stdout, stderr=subprocess.STDOUT, supervise=True, start_new_session=True)
                     output.spawned()
                     while child.poll() is None:
@@ -136,6 +153,11 @@ def _prepare(root, comfy, machine, run, download):
                     engine_python=machine['python'], python=sys.version.split()[0])
     key = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()[:16]
     env_root = root / 'envs' / ('comfyui-' + key)
+    if not env_root.exists():
+        # An update of ComfyUI changes only requirements.txt: update the
+        # environment it already uses, PyTorch included as is, instead of
+        # downloading and installing another full environment beside it.
+        env_root = previous_environment(root, identity) or env_root
     python = env_root / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
     receipt = env_root / 'freevideo-host.json'
     if not (python.is_file() and receipt.is_file() and json.loads(receipt.read_text(encoding='utf-8')) == identity):

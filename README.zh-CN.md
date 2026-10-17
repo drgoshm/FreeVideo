@@ -19,6 +19,8 @@ https://github.com/user-attachments/assets/ecda7d0d-7fbe-4e0c-8c29-8f3315bafc15
 
 ## 更新动态
 
+- **2026-10-07** · **[v0.3.2](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.2)：先出预览。** 先看半分辨率预览，满意的再继续二采。
+- **2026-10-07** · **[v0.3.0](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.3.0)：更快的 int8 模型。** GeForce 和 RTX 30 系显卡改用 int8，RTX 3090 生成 5 秒视频快约 2.3 倍。
 - **2026-10-06** · **[作品展示](https://freevideo-community.pages.dev/#gallery)上线。** 观看 FreeVideo 生成的 20 秒视频，以及四档质量的并排对比。
 - **2026-10-06** · **[v0.2.3](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.2.3)：视频自带工作流。** 把 FreeVideo 生成的视频拖到 ComfyUI 画布上，即可还原提示词、种子和全部参数，之前的视频也能补上。
 - **2026-10-05** · **[v0.2.0](https://github.com/FlashML-org/FreeVideo/releases/tag/v0.2.0)：四档质量。** 每次生成可选择轻量、标准、精细或极致，档位越高，生成质量越高，但耗时更长；生成结果可导出为带生成耗时和显卡信息的分享图片或视频。
@@ -32,7 +34,7 @@ FreeVideo 是面向消费级显卡的 MiniMax H3 本地推理引擎，基于 [Op
 
 它统一调度显存、内存与磁盘，并根据硬件条件调整权重放置、计算精度和注意力内核。FreeVideo 以 ComfyUI 插件形式提供，配备 Windows 启动器，也支持 Linux 命令行。主要特性包括：
 
-- **硬件自适应**：针对不同显卡架构选择 FP8 计算路径（原生 FP8，或 FP8 存储配合 BF16 计算），并自动探测可用的注意力内核，无需手动配置。
+- **硬件自适应**：针对不同显卡选择权重格式（GeForce 和 RTX 30 系用 int8，专业卡和数据中心卡用 FP8），并自动探测可用的注意力内核，无需手动配置。
 - **低显存推理**：通过权重流式加载、异步预取与分块计算降低峰值显存，最低只需 8GB 显存和 16GB 内存。
 - **多模态输入**：支持文本、首帧、尾帧，以及图像、视频、音频参考输入。
 - **社区 LoRA**：支持在工作流中使用 MiniMax H3 社区 LoRA。[查看效果对比](docs/LoRA.zh-CN.md)。
@@ -51,7 +53,7 @@ FreeVideo 是面向消费级显卡的 MiniMax H3 本地推理引擎，基于 [Op
   <img alt="FreeVideo 创作面板" src="https://github.com/user-attachments/assets/f4719079-bb48-4836-9c64-2473477cd1a0" width="92%">
 </div>
 
-**离线安装：** 从[夸克网盘](https://pan.quark.cn/s/c51235b84618)下载离线包，将 ZIP 文件直接拖入启动器，无需解压。需要「公用模型」包和对应显卡的模型包（30/40 系或 50 系）；全新安装 ComfyUI 时还需要「运行环境」包。
+**离线安装：** 从[夸克网盘](https://pan.quark.cn/s/c51235b84618)下载离线包，将 ZIP 文件直接拖入启动器，无需解压。完全离线安装需要「视频模型」「文本编码器」「视频与音频解码器」「采样缓存」四个模型包，全新安装 ComfyUI 时还需要「运行环境」包。也可以只导入「运行环境」包，再在模型来源中选择**自动下载**（v0.3.12 及以上）。「音频参考缓存」为可选包，仅在参考素材带有音频时使用。
 
 ### macOS（Apple 芯片预览版）
 
@@ -92,6 +94,8 @@ git clone https://github.com/FlashML-org/FreeVideo.git && cd FreeVideo
 ### 更多文档
 
 - [FreeVideo Adaptive Execution Planner](docs/zh-CN/execution-planning.md)
+- [Radeon AI PRO R9700：Linux ROCm 运行及实测耗时](docs/ROCm.md)
+- [社区实测](docs/zh-CN/community-results.md)
 
 ### 问题反馈
 
