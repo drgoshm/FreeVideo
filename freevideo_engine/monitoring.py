@@ -104,6 +104,9 @@ def thermal_slowdown(measured, *, share=.5, clock_ratio=.7, minimum_samples=200)
 
 class Monitor:
     def __new__(cls, path, interval=0.05, device=None):
+        if cls is Monitor and windows() and os.environ.get('FREEVIDEO_WINDOWS_AMD_ADAPTER'):
+            from .wddm_monitoring import WDDMMonitor
+            return object.__new__(WDDMMonitor)
         if cls is Monitor and os.environ.get('ROCR_VISIBLE_DEVICES'):
             from .rocm_monitoring import ROCmMonitor
             return object.__new__(ROCmMonitor)

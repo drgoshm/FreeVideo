@@ -84,6 +84,13 @@ def frozen_versions(text):
 
 
 def identity(machine, hardware):
+    # Saved optimization reports use bootstrap's NVIDIA-only inventory and
+    # driver identity. Do not probe nvidia-smi or reuse those profiles on HIP.
+    # generate treats ValueError as unavailable optional tuning and continues
+    # with the live automatic resource policy.
+    if hardware.hip_version:
+        raise ValueError('Saved NVIDIA optimization profiles are unavailable on ROCm; '
+                         'using automatic resource planning')
     from .bootstrap import inventory, model_target
     from .install_tuning import required_models
     observed = inventory(machine['gpu_uuid'])

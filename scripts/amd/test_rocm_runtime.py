@@ -29,6 +29,20 @@ class ROCmRuntime(unittest.TestCase):
     def test_cuda_architecture_is_preserved(self):
         self.assertEqual(self.hardware().architecture, 'blackwell-rtx')
 
+    def test_rocm_optional_tuning_does_not_query_nvidia(self):
+        from freevideo_engine import tuning
+        with patch('freevideo_engine.bootstrap.inventory', side_effect=AssertionError('NVIDIA query')) as inventory:
+            with self.assertRaisesRegex(ValueError, 'automatic resource planning'):
+                tuning.identity({'gpu_uuid': 'GPU-amd'}, self.hardware(hip_version='7.16', gcn_arch='gfx1201'))
+            inventory.assert_not_called()
+
+    def test_cuda_tuning_still_checks_selected_gpu(self):
+        from freevideo_engine import tuning
+        with patch('freevideo_engine.bootstrap.inventory', side_effect=RuntimeError('inventory reached')) as inventory:
+            with self.assertRaisesRegex(RuntimeError, 'inventory reached'):
+                tuning.identity({'gpu_uuid': 'GPU-nvidia'}, self.hardware())
+            inventory.assert_called_once_with('GPU-nvidia')
+
     def dispatch(self, *, hip='7.15', arch='gfx1201', chunk=2048,
                  recompute=False, selected='tail-preserving'):
         calls = []
