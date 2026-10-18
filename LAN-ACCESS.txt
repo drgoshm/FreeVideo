@@ -1,0 +1,97 @@
+FreeVideo: защищённый доступ с Mac и других устройств LAN
+=======================================================
+
+Сервер после запуска Start-FreeVideo.bat:
+  На компьютере с Radeon: http://127.0.0.1:8188/
+  В локальной сети: https://192.168.168.102:8443/
+
+Обычный ComfyUI слушает только localhost. Весь удалённый интерфейс, включая
+Autopilot, API, загрузки файлов и WebSocket, проходит через HTTPS-вход.
+Не возвращайте --listen 0.0.0.0 на внутреннем порту 8188: это обойдёт авторизацию.
+На роутере переадресация портов не нужна. Gateway допускает только частные
+адреса LAN и loopback; правило Windows ограничено частной сетью и LocalSubnet.
+
+Первое подключение с macOS
+-------------------------
+1. Передайте с компьютера FreeVideo на свой Mac через доверенный канал два файла:
+     lan-access/FreeVideo-LAN-CA.crt  — публичный сертификат;
+     lan-access/access-key.txt      — секретный ключ доступа.
+   server-key.pem передавать нельзя: это закрытый ключ самого HTTPS-сервера.
+
+2. На Mac откройте «Связка ключей» (Keychain Access), выберите связку «Вход»
+   (login) и импортируйте FreeVideo-LAN-CA.crt. Откройте импортированный
+   сертификат FreeVideo LAN, раскройте «Доверие» и разрешите доверие для SSL.
+   Подтвердите изменение средствами macOS. Это действие выполняет владелец Mac.
+   Не обходите предупреждение браузера о сертификате: сначала настройте доверие.
+   Инструкции Apple:
+   https://support.apple.com/guide/keychain-access/kyca2431/mac
+   https://support.apple.com/guide/keychain-access/kyca11871/mac
+
+3. Проверьте SHA-256 отпечаток CA по значению ca_sha256 в lan-access/config.json
+   на компьютере FreeVideo. Команда на Mac:
+     openssl x509 -in FreeVideo-LAN-CA.crt -noout -fingerprint -sha256
+
+4. Откройте https://192.168.168.102:8443/ и введите ключ из access-key.txt.
+   После входа появится обычный интерфейс и вкладка Autopilot.
+   Если ранее открывали старый адрес, откройте новый адрес отдельной вкладкой.
+
+5. Кнопка Access / sign out в переключателе Create / Nodes / Edit / Autopilot
+   открывает страницу выхода. Её адрес: /_lan/account.
+
+LLM-агент на Mac
+---------------
+Подготовьте приватную папку, например ~/.config/freevideo, и положите туда
+сертификат и ключ. Установите права 700 на папку и 600 на файл ключа.
+Передайте агенту пути к этим файлам, не содержимое ключа.
+
+Переменные окружения для Python-клиента этой версии FreeVideo:
+  FREEVIDEO_URL=https://192.168.168.102:8443
+  FREEVIDEO_TOKEN_FILE=/Users/YOUR_NAME/.config/freevideo/access-key.txt
+  FREEVIDEO_CA_FILE=/Users/YOUR_NAME/.config/freevideo/FreeVideo-LAN-CA.crt
+
+Агенту для прямого HTTP API не нужны модели или ROCm. Он должен читать ключ
+из файла, отправлять его в Authorization: Bearer и проверять HTTPS-сертификат
+с помощью переданного CA. Проверка сертификата остаётся включённой.
+Инструкции API после авторизации:
+  GET https://192.168.168.102:8443/freevideo/agent/v1/connect?format=json
+  GET https://192.168.168.102:8443/freevideo/agent/v1/guide
+
+Если на Mac есть исходники этой версии FreeVideo, stdio MCP запускается так:
+  python3 -m freevideo_engine.agent.mcp --url https://192.168.168.102:8443 --token-file /Users/YOUR_NAME/.config/freevideo/access-key.txt --ca-file /Users/YOUR_NAME/.config/freevideo/FreeVideo-LAN-CA.crt
+
+Кнопка Connect в Autopilot выдаёт сетевой адрес. Внутренний agent/token с
+Windows-компьютера копировать не нужно. Ключ LAN даёт права оператора этой
+установки; это не система изоляции разных пользователей.
+
+Сроки и отзыв доступа
+--------------------
+Сессии браузера живут до 12 часов, привязаны к адресу клиента и забываются
+после перезапуска. Выход отзывает текущую сессию, включая её WebSocket.
+Ключ для агентов действует до его замены. Для отзыва всех выданных ключей:
+  .venv\Scripts\python.exe scripts/setup_lan_access.py --rotate-key
+Затем перезапустите FreeVideo и передайте новый ключ доверенным устройствам.
+Одна только замена файла без перезапуска не отзывает уже работающий gateway.
+
+Сертификат сервера действует год; срок записан в config.json. При смене IP
+или обновлении сертификата понадобится заново подготовить LAN-конфигурацию
+и доверить новый CA на клиентах. Старую конфигурацию сначала сохраните в
+защищённую резервную копию. Повторный setup не перезаписывает её автоматически.
+
+Реализация и проверки
+--------------------
+TLS 1.2+, отдельный случайный ключ, Secure/HttpOnly/SameSite=Strict cookie,
+проверки Host/Origin, запрет ключей в URL, ограничение попыток входа, локальный
+backend и эфемерный секрет между backend и gateway. Обычный LAN-прокси не
+получает права Autopilot; поддельные proxy-заголовки отбрасываются.
+Существующие CSRF-проверки Autopilot продолжают действовать.
+
+Тесты без GPU:
+  .venv\Scripts\python.exe scripts/test_lan_access.py -v
+
+Секреты и сертификаты в lan-access/ исключены из Git. Ключи не печатаются
+при настройке и не включаются в диагностические отчёты. Модель безопасности
+предполагает доверенный компьютер-сервер и доверенные расширения ComfyUI.
+
+Рекомендации по CSRF и сессиям:
+https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html
+https://cheatsheetseries.owasp.org/cheatsheets/Session_Management_Cheat_Sheet.html

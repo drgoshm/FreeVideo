@@ -47,6 +47,9 @@ BEFORE_LINES, BEFORE_TEXT = 8, 600
 
 def local_address(request):
     """The backend's bound port, independent of page origins and forwarding headers."""
+    if access.authenticated_lan(request):
+        from .. import proxy_identity
+        return request.headers[proxy_identity.ORIGIN]
     socket = request.transport.get_extra_info('sockname') if request.transport else None
     if not socket:
         raise JobError('not_ready', 'Listening address unavailable')
@@ -455,6 +458,10 @@ def register():
                         raise JobError('page_session_required', 'Page session required')
                 header = request.headers.get('Authorization', '')
                 given = header[7:].strip() if header[:7].lower() == 'bearer ' else request.headers.get('X-FreeVideo-Agent', '')
+                # A separate LAN access key authenticates remote agents at the TLS
+                # gateway. The installation token never leaves this computer.
+                if access.authenticated_lan(request) and request.headers.get(proxy_identity.LAN_AUTH) == 'agent':
+                    given = expected()
                 if definition.get('auth', True) or given:
                     try:
                         token = expected()
@@ -658,7 +665,7 @@ def register():
         """guarded verifies supplied tokens; otherwise require a local page and CSRF."""
         header = request.headers.get('Authorization', '')
         given = header[7:].strip() if header[:7].lower() == 'bearer ' else request.headers.get('X-FreeVideo-Agent', '')
-        if given:
+        if given or (access.authenticated_lan(request) and request.headers.get(proxy_identity.LAN_AUTH) == 'agent'):
             return 'agent'
         page = page_sessions.get(request.cookies.get('freevideo_agent_page', ''))
         csrf = request.headers.get('X-FreeVideo-CSRF', '')
@@ -704,7 +711,11 @@ def register():
         if root in token_failures:
             # No token this startup: the same single answer as when it is off, so the page shows no agent controls.
             return reply({'enabled': False})
-        return reply(connection_discovery(root, request.scheme + '://' + request.host, request[query_key].get('lang')))
+        value = connection_discovery(root, local_address(request) if access.authenticated_lan(request)
+                                     else request.scheme + '://' + request.host, request[query_key].get('lang'))
+        if access.authenticated_lan(request):
+            value['token'] = 'The separate LAN access key supplied by the owner; never the installation token.'
+        return reply(value)
 
     @routes.get('/freevideo/agent/session')
     @guarded
@@ -1111,6 +1122,9 @@ def register():
         from .guide import page_language
         from .mcp import client_config, linux_wrapper_supported, python_shell_command, shell_quote
         page_language(request[query_key].get('lang'))
+        if access.authenticated_lan(request):
+            return reply(dict(address=local_address(request), api=PREFIX, remote=True,
+                              instructions='Use the LAN access key and verified HTTPS to connect an agent.', agents=[]))
         try:
             root = installation_root()
             prepare_token(root)
@@ -1159,9 +1173,13 @@ def register():
         def begun():
             here = store.current_for(chat['client']) if store is not None and chat['client'] else None
             return bool(here and store.get(here)['last_seq'])
-        value = connection_guide(root, request.scheme + '://' + request.host, request[query_key].get('lang'),
+        value = connection_guide(root, local_address(request) if access.authenticated_lan(request)
+                                 else request.scheme + '://' + request.host, request[query_key].get('lang'),
                                  dict(continuation=await asyncio.to_thread(jobs.continuation_ready), editing=available()),
                                  resumed=await asyncio.to_thread(begun))
+        if access.authenticated_lan(request):
+            from .lan_guide import remote_guide
+            value = remote_guide(value)
         if request[query_key].get('format') == 'json':
             return reply(value)
         return web.Response(text=connection_text(value), content_type='text/plain', headers={'Cache-Control': 'no-store'})

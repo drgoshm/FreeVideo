@@ -9,6 +9,7 @@ import base64
 import json
 import ipaddress
 import os
+import ssl
 from pathlib import Path
 import threading
 import time
@@ -77,6 +78,16 @@ def origin(url):
     return value.scheme, value.hostname.lower(), value.port or (443 if value.scheme == 'https' else 80)
 
 
+def urlsplit_host_is_remote_http(url):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != 'http' or parsed.hostname == 'localhost':
+        return False
+    try:
+        return not ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        return True
+
+
 def one_job(answer):
     """The job of a single-job answer, without the copy the server adds under 'job'."""
     return {key: value for key, value in answer.items() if key != 'job'}
@@ -103,12 +114,13 @@ class CredentialRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-def controlled_opener():
-    return urllib.request.build_opener(LocalProxyHandler(), CredentialRedirect())
+def controlled_opener(cafile=None):
+    return urllib.request.build_opener(LocalProxyHandler(), CredentialRedirect(),
+                                      urllib.request.HTTPSHandler(context=ssl.create_default_context(cafile=cafile)))
 
 
 class Client:
-    def __init__(self, url=None, token=None, *, root=None, name='freevideo-python', timeout=60):
+    def __init__(self, url=None, token=None, *, root=None, name='freevideo-python', timeout=60, token_file=None, ca_file=None):
         root = Path(root).expanduser() if root else default_root()
         self.root = root
         endpoint = {}
@@ -117,10 +129,13 @@ class Client:
         except (OSError, ValueError):
             pass
         self.url = endpoint_url(url or os.environ.get('FREEVIDEO_URL') or (endpoint.get('url') if isinstance(endpoint, dict) else None) or 'http://127.0.0.1:8188')
-        self.opener = controlled_opener()
+        self.opener = controlled_opener(ca_file or os.environ.get('FREEVIDEO_CA_FILE'))
+        credential_path = token_file or os.environ.get('FREEVIDEO_TOKEN_FILE')
+        if urlsplit_host_is_remote_http(self.url):
+            raise ValueError('Remote access keys require HTTPS')
         if token is None:
             try:
-                token = (root / 'agent' / 'token').read_text(encoding='ascii').strip()
+                token = (Path(credential_path) if credential_path else root / 'agent' / 'token').read_text(encoding='ascii').strip()
             except OSError:
                 token = None
         self.token, self.name, self.timeout = token, name, timeout

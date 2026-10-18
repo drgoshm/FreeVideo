@@ -12,6 +12,10 @@ const cn = languageOverride === 'zh' || (languageOverride !== 'en'
     && String(navigator.language || '').toLowerCase().startsWith('zh'));
 const t = (en, zh) => cn ? zh : en;
 const preference = 'freevideo.view';
+const lanAccess = typeof location !== 'undefined' && location.protocol === 'https:'
+    ? fetch('/_lan/status', {credentials: 'same-origin', cache: 'no-store'})
+        .then(async response => response.ok && (await response.json()).authenticated === true).catch(() => false)
+    : Promise.resolve(false);
 let toolbar, open, selected, currentView = 'nodes', agentTab = null, opening = null;
 const style = document.createElement('link');
 style.rel = 'stylesheet'; style.href = new URL('./view_navigation.css', import.meta.url).href;
@@ -63,6 +67,11 @@ export function viewSwitch(view, onStudio, onNodes, onEditor, onAutopilot) {
         }
         group.append(button);
     }
+    const account = document.createElement('button'); account.type = 'button'; account.hidden = true;
+    account.textContent = t('Access / sign out', '访问 / 退出');
+    account.onclick = () => location.assign('/_lan/account');
+    lanAccess.then(enabled => { account.hidden = !enabled; });
+    group.append(account);
     return group;
 }
 

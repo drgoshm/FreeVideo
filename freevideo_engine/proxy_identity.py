@@ -11,6 +11,7 @@ ENV = 'FREEVIDEO_PROXY_HOP_SECRET'
 HEADER = 'X-FreeVideo-Proxy-Hop'
 PEER = 'X-FreeVideo-Proxy-Peer'
 ORIGIN = 'X-FreeVideo-Proxy-Origin'
+LAN_AUTH = 'X-FreeVideo-Proxy-Lan-Auth'
 
 
 @lru_cache(maxsize=1)

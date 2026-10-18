@@ -73,3 +73,5 @@ engine-gpu-*.lock
 /optional/
 *.gguf
 /out/
+/lan-access/
+/agent/

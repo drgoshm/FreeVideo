@@ -22,7 +22,7 @@ import time
 from .client import ApiError, Client, DONE
 
 PROTOCOLS = ('2025-06-18', '2025-03-26', '2024-11-05')
-INSTRUCTIONS = """FreeVideo generates videos (MiniMax H3) on this computer's GPU.
+INSTRUCTIONS = """FreeVideo generates videos (MiniMax H3) on the FreeVideo server's GPU.
 Start with freevideo_status and freevideo_capabilities. Write prompts as the guide says (freevideo_prompt_guide): English sections
 integrated_multimodal_description / overall_soundscape / non_diegetic_music, [Shot N] cuts, (S1) <d>[Language] ...</d>
 dialogue. Generation uses continuous chains and takes minutes: submit, then call freevideo_wait (at most 25 seconds)
@@ -484,8 +484,10 @@ def main(argv=None):
     parser.add_argument('--root', type=Path, help='FreeVideo installation folder')
     parser.add_argument('--url', help='ComfyUI address (default: from the installation, else http://127.0.0.1:8188)')
     parser.add_argument('--print-config', action='store_true', help='Print client configuration and exit')
+    parser.add_argument('--token-file', type=Path, help='Private LAN access key file on this client')
+    parser.add_argument('--ca-file', type=Path, help='Trusted CA for the HTTPS LAN gateway')
     args = parser.parse_args(argv)
-    client = Client(args.url, root=args.root, name='freevideo-mcp')
+    client = Client(args.url, root=args.root, name='freevideo-mcp', token_file=args.token_file, ca_file=args.ca_file)
     if args.print_config:
         print_config(client.root)
         return 0

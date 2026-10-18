@@ -27,12 +27,31 @@ def lan_enabled():
         return False
 
 
+def authenticated_lan(request):
+    """Only the TLS gateway holding this process's ephemeral hop secret can grant control."""
+    if (not proxy_identity.trusted(request) or
+            request.headers.get(proxy_identity.LAN_AUTH) not in ('browser', 'agent')):
+        return False
+    try:
+        peer = request.transport.get_extra_info('peername')[0]
+        origin = urlsplit(request.headers.get(proxy_identity.ORIGIN, ''))
+        address = peer_address(request)
+        return (ipaddress.ip_address(peer).is_loopback and origin.scheme == 'https'
+                and address is not None and address.is_private and not address.is_unspecified
+                and not address.is_multicast and not address.is_link_local)
+    except (ValueError, TypeError, IndexError, AttributeError):
+        return False
+
+
 def check(request, *, local=False):
     address = peer_address(request)
     proxied = proxy_identity.HEADER in request.headers
-    # Even a proxy client on loopback is never a local control-plane client.
-    if (proxied and (not proxy_identity.trusted(request) or local or not lan_enabled())
-            or address is None or not address.is_loopback and (local or not address.is_private or not lan_enabled())):
+    control = authenticated_lan(request)
+    # The ordinary product proxy remains excluded from local controls. Only the
+    # authenticated HTTPS gateway explicitly delegates an operator's session.
+    if (proxied and (not proxy_identity.trusted(request) or (local and not control) or not (control or lan_enabled()))
+            or address is None or not address.is_loopback and
+            ((local and not control) or not address.is_private or not (control or lan_enabled()))):
         raise JobError('local_only', 'Peer is not permitted')
     socket = request.transport.get_extra_info('sockname') if request.transport else None
     try:

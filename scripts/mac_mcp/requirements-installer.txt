@@ -1,0 +1,3 @@
+numpy>=2,<3
+pillow>=11,<13
+tomlkit==0.13.3

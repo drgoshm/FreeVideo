@@ -57,7 +57,7 @@ def forwarded(request):
     for name, value in request.headers.items():
         lower = name.lower()
         if lower in HOP_BY_HOP or lower in ('authorization', proxy_identity.HEADER.lower(),
-                                           proxy_identity.PEER.lower(), proxy_identity.ORIGIN.lower()):
+                                           proxy_identity.PEER.lower(), proxy_identity.ORIGIN.lower(), proxy_identity.LAN_AUTH.lower()):
             continue
         if lower == 'cookie':
             value = '; '.join(part for part in value.split(';') if part.strip() and
